@@ -36,7 +36,9 @@ V24 improvements over V23
        persisted in final_result['reasoning_trace'] for auditability.
 
 5. ROBUSTNESS
-     - Stage-1 completeness validation with a single retry before ABSTAIN.
+     - Stage-1 completeness validation with a single retry.
+     - Always classifies (no ABSTAIN): unparseable LLM output falls back to the
+       ML majority vote, so every sample is scored over the same denominator N.
      - Data-quality guards (negative duration, requested<=0, parse failures)
        surfaced to the LLM instead of silently passing zeros.
      - Deterministic decoding (temperature=0) actually plumbed through to
@@ -698,8 +700,21 @@ class SimpleOllamaClient:
             opts['num_predict'] = max_tokens
         return opts
 
+    @staticmethod
+    def _content_or_thinking(response, tag="THINK"):
+        """Return the visible answer; if a thinking model left `content` empty
+        (or spent its budget reasoning), fall back to the reasoning text so we
+        can still parse a verdict. Fixes GLM returning near-empty responses."""
+        content  = response.message.content or ""
+        thinking = getattr(response.message, 'thinking', None) or ""
+        if thinking:
+            print(f"    [{tag}] {len(thinking)} chars reasoning")
+        if not content.strip() and thinking:
+            content = thinking
+        return content
+
     def generate_with_system(self, system_prompt, user_prompt,
-                             temperature=0.0, max_tokens=1024, **kwargs):
+                             temperature=0.0, max_tokens=2048, **kwargs):
         try:
             is_qwen  = "qwen" in self.model_name.lower()
             messages = [{'role': 'system', 'content': system_prompt},
@@ -708,18 +723,15 @@ class SimpleOllamaClient:
             if is_qwen:
                 response = self.chat(model=self.model_name, messages=messages,
                                      think=True, options=options)
-                thinking = getattr(response.message, 'thinking', None) or ""
-                content  = response.message.content or ""
-                if thinking:
-                    print(f"    [THINK] {len(thinking)} chars reasoning")
-                return content
-            return self.chat(model=self.model_name, messages=messages,
-                             options=options).message.content
+            else:
+                response = self.chat(model=self.model_name, messages=messages,
+                                     options=options)
+            return self._content_or_thinking(response, tag="THINK")
         except Exception as e:
             return f"Error: {str(e)}"
 
     def generate_two_turn(self, system_prompt, first_user, first_assistant, second_user,
-                          temperature=0.0, max_tokens=1024):
+                          temperature=0.0, max_tokens=2048):
         try:
             is_qwen  = "qwen" in self.model_name.lower()
             messages = [
@@ -732,13 +744,10 @@ class SimpleOllamaClient:
             if is_qwen:
                 response = self.chat(model=self.model_name, messages=messages,
                                      think=True, options=options)
-                thinking = getattr(response.message, 'thinking', None) or ""
-                content  = response.message.content or ""
-                if thinking:
-                    print(f"    [THINK-2] {len(thinking)} chars reasoning")
-                return content
-            return self.chat(model=self.model_name, messages=messages,
-                             options=options).message.content
+            else:
+                response = self.chat(model=self.model_name, messages=messages,
+                                     options=options)
+            return self._content_or_thinking(response, tag="THINK-2")
         except Exception as e:
             return f"Error: {str(e)}"
 
@@ -752,7 +761,10 @@ class EVIDSAgentV6TripleLLMV24:
     evidence (normalised SHAP %, SHAP<->LIME agreement, cross-model consensus,
     confidence-weighted tally), an optimally engineered prompt with a forced
     6-step reasoning chain + few-shot anchors, full reasoning-trace capture,
-    and Stage-1 completeness validation with one retry before ABSTAIN.
+    and Stage-1 completeness validation with one retry. Like V20, the agent
+    ALWAYS emits a Normal/Attack decision (no ABSTAIN): if the LLM verdict is
+    unparseable it falls back to the ML majority vote, so every sample is
+    scored and all metrics share the same denominator N.
     """
 
     # Required reasoning-step headers Stage 1 MUST contain (for validation).
@@ -1096,7 +1108,12 @@ Now produce STEP 1 through STEP 6 exactly as specified in your instructions, cit
         }
         steps_present = sum(1 for v in reasoning_trace.values() if v)
 
-        # Fallback: ABSTAIN (never silently default to ML majority — V22+ design)
+        # Fallback: an IDS must ALWAYS classify — no ABSTAIN. If the verdict
+        # line is missing, infer from tone; if still unclear, defer to the ML
+        # majority vote (the ML models act as helpers for the LLM). This keeps
+        # every sample scored, so all denominators equal N and every model is
+        # directly comparable (same convention as V20).
+        ml_majority = votes.most_common(1)[0][0] if votes else 'Normal'
         if predicted_label is None:
             atk = resp_lower.count('attack') + resp_lower.count('malicious') + resp_lower.count('fraud')
             nrm = resp_lower.count('normal') + resp_lower.count('legitimate')
@@ -1107,23 +1124,21 @@ Now produce STEP 1 through STEP 6 exactly as specified in your instructions, cit
                 predicted_label = 'Normal'
                 print(f"    [WARN] Prediction inferred from tone: Normal")
             else:
-                predicted_label = 'ABSTAIN'
+                predicted_label = ml_majority
                 llm_confidence  = "low"
-                print(f"    [ERROR] LLM response unparseable — recording ABSTAIN")
+                print(f"    [WARN] LLM unparseable — fallback to ML majority: {ml_majority}")
 
         if predicted_label == 'Malicious' and attack_type == 'none':
             attack_type = ('energy_theft'    if delivery_ratio > 1.3 else
                            'phantom_charging' if delivery_ratio < 0.7 else
                            'unknown_attack')
 
-        ml_majority     = votes.most_common(1)[0][0] if votes else 'Normal'
-        llm_overrode_ml = (predicted_label not in ('ABSTAIN',) and
-                           predicted_label != ml_majority)
+        llm_overrode_ml = (predicted_label != ml_majority)
 
         llm_conf_score  = {'high': 0.90, 'medium': 0.65, 'low': 0.40}.get(llm_confidence, 0.65)
         ml_agreement    = (sum(1 for p in all_predictions.values()
                                if p['prediction'] == predicted_label)
-                           / len(all_predictions)) if predicted_label != 'ABSTAIN' else 0.0
+                           / len(all_predictions))
         reasoning_depth = min(1.0, (len(stage1_response) + len(stage2_response)) / 1800)
         # reasoning completeness now factors into the composite score
         completeness    = steps_present / 6.0

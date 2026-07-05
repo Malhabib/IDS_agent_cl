@@ -67,15 +67,12 @@ def make_json_serializable(obj):
 
 
 def calculate_metrics(y_true, y_pred):
-    paired = [(t, p) for t, p in zip(y_true, y_pred) if p != 'ABSTAIN']
-    if not paired:
-        return {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1': 0, 'far': 0,
-                'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0, 'abstain': len(y_pred)}
-    yt, yp   = zip(*paired)
-    y_t = [1 if l == 'Malicious' else 0 for l in yt]
-    y_p = [1 if l == 'Malicious' else 0 for l in yp]
-    correct  = sum(a == b for a, b in zip(yt, yp))
-    accuracy = correct / len(yt)
+    # Standard IDS metrics over ALL samples — every session is classified
+    # (no ABSTAIN), so the denominator is always N and models are comparable.
+    y_t = [1 if l == 'Malicious' else 0 for l in y_true]
+    y_p = [1 if l == 'Malicious' else 0 for l in y_pred]
+    correct  = sum(a == b for a, b in zip(y_true, y_pred))
+    accuracy = correct / len(y_true) if y_true else 0
     cm = confusion_matrix(y_t, y_p, labels=[0, 1])
     if cm.shape == (2, 2):
         tn, fp, fn, tp = cm.ravel()
@@ -84,10 +81,9 @@ def calculate_metrics(y_true, y_pred):
         f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
         far  = fp / (fp + tn) if (fp + tn) > 0 else 0
         return {'accuracy': accuracy, 'precision': prec, 'recall': rec, 'f1': f1,
-                'far': far, 'tp': int(tp), 'tn': int(tn), 'fp': int(fp), 'fn': int(fn),
-                'abstain': len(y_pred) - len(yt)}
+                'far': far, 'tp': int(tp), 'tn': int(tn), 'fp': int(fp), 'fn': int(fn)}
     return {'accuracy': accuracy, 'precision': 0, 'recall': 0, 'f1': 0, 'far': 0,
-            'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0, 'abstain': len(y_pred) - len(yt)}
+            'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0}
 
 
 def load_or_train_models(data_path, models_dir):
@@ -203,29 +199,24 @@ def run_classification(agent, emoji, label, selected, df, model_name, ollama_url
                     'ground_truth':      gt,
                     'predicted':         pred,
                     'correct':           correct,
-                    'abstained':         pred == 'ABSTAIN',
                     'model_predictions': result['model_predictions'],
                     'evidence_bundle':   result.get('evidence_bundle', {}),
                     'result':            result['result'],
                     'majority_vote':     result['majority_vote']
                 })
-                if pred == 'ABSTAIN':
-                    print(f"\n  [ABSTAIN] Truth={gt}")
-                else:
-                    sym = "OK" if correct else "WRONG"
-                    print(f"\n  [{sym}] Truth={gt}, Predicted={pred}, "
-                          f"Override={result['result']['llm_overrode_ml']}")
-                if correct and pred != 'ABSTAIN':
+                sym = "OK" if correct else "WRONG"
+                print(f"\n  [{sym}] Truth={gt}, Predicted={pred}, "
+                      f"Override={result['result']['llm_overrode_ml']}")
+                if correct:
                     agent.store_correct_decision_in_ltm(idx, True, result['result'])
         except Exception as e:
             print(f"\n  [ERROR] {e}")
             import traceback
             traceback.print_exc()
-    cc      = sum(1 for r in results if r['correct'])
-    abstain = sum(1 for r in results if r.get('abstained'))
+    cc = sum(1 for r in results if r['correct'])
     if results:
         print(f"\n{label} COMPLETE: {cc}/{len(results)} correct "
-              f"({cc/len(results)*100:.1f}%), abstained={abstain}")
+              f"({cc/len(results)*100:.1f}%)")
     return results
 
 
@@ -379,12 +370,6 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
     qwen_m  = {'IDS_Agent': calculate_metrics(ground_truths, qwen_preds['IDS_Agent'])}
     glm_m   = {'IDS_Agent': calculate_metrics(ground_truths, glm_preds['IDS_Agent'])}
 
-    # ABSTAIN
-    print(f"\nABSTAIN COUNTS:")
-    for name, results in [('Llama', results_llama), ('Qwen', results_qwen), ('GLM', results_glm)]:
-        n_abs = sum(1 for r in results if r.get('abstained'))
-        print(f"  {name}: {n_abs}/{len(results)} abstained")
-
     # METRICS TABLE
     print(f"\n{'Metric':<15} |", end='')
     for mn in ml_names:
@@ -405,26 +390,25 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
 
     # CONFUSION MATRIX TABLE
     print(f"\n{'Model':<20} | {'TP':>4} | {'TN':>4} | {'FP':>4} | {'FN':>4} | "
-          f"{'Acc':>6} | {'Prec':>6} | {'Rec':>6} | {'F1':>6} | {'Abstain':>7}")
-    print("-" * 100)
+          f"{'Acc':>6} | {'Prec':>6} | {'Rec':>6} | {'F1':>6}")
+    print("-" * 90)
     for mn in ml_names:
         m = llama_m[mn]
         print(f"{mn:<20} | {m['tp']:>4} | {m['tn']:>4} | {m['fp']:>4} | {m['fn']:>4} | "
               f"{m['accuracy']:>6.4f} | {m['precision']:>6.4f} | "
-              f"{m['recall']:>6.4f} | {m['f1']:>6.4f} | {'—':>7}")
+              f"{m['recall']:>6.4f} | {m['f1']:>6.4f}")
     m = llama_m['Majority_Vote']
     print(f"{'Majority Vote':<20} | {m['tp']:>4} | {m['tn']:>4} | {m['fp']:>4} | {m['fn']:>4} | "
           f"{m['accuracy']:>6.4f} | {m['precision']:>6.4f} | "
-          f"{m['recall']:>6.4f} | {m['f1']:>6.4f} | {'—':>7}")
-    for llm_name, metrics, results in [
-            ('Llama Agent V24', llama_m['IDS_Agent'], results_llama),
-            ('Qwen Agent V24',  qwen_m['IDS_Agent'],  results_qwen),
-            ('GLM Agent V24',   glm_m['IDS_Agent'],   results_glm)]:
-        m     = metrics
-        n_abs = sum(1 for r in results if r.get('abstained'))
+          f"{m['recall']:>6.4f} | {m['f1']:>6.4f}")
+    for llm_name, metrics in [
+            ('Llama Agent V24', llama_m['IDS_Agent']),
+            ('Qwen Agent V24',  qwen_m['IDS_Agent']),
+            ('GLM Agent V24',   glm_m['IDS_Agent'])]:
+        m = metrics
         print(f"{llm_name:<20} | {m['tp']:>4} | {m['tn']:>4} | {m['fp']:>4} | {m['fn']:>4} | "
               f"{m['accuracy']:>6.4f} | {m['precision']:>6.4f} | "
-              f"{m['recall']:>6.4f} | {m['f1']:>6.4f} | {n_abs:>7}")
+              f"{m['recall']:>6.4f} | {m['f1']:>6.4f}")
 
     # HEATMAPS
     print(f"\n{'='*120}")
@@ -441,10 +425,9 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
     print(f"LLM OVERRIDE ANALYSIS")
     print(f"{'='*120}")
     for llm_name, results in [('Llama', results_llama), ('Qwen', results_qwen), ('GLM', results_glm)]:
-        non_abs    = [r for r in results if not r.get('abstained')]
-        overrides  = [r for r in non_abs if r['result'].get('llm_overrode_ml')]
+        overrides  = [r for r in results if r['result'].get('llm_overrode_ml')]
         correct_ov = sum(1 for r in overrides if r['correct'])
-        agreed     = [r for r in non_abs if not r['result'].get('llm_overrode_ml')]
+        agreed     = [r for r in results if not r['result'].get('llm_overrode_ml')]
         agreed_cor = sum(1 for r in agreed if r['correct'])
         print(f"\n  {llm_name}:")
         if agreed:
@@ -473,22 +456,19 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
     maj_acc = maj_correct / len(results_llama)
     print(f"  ML Majority baseline: {maj_acc:.4f}\n")
     print(f"  {'LLM':<12} | {'Accuracy':>10} | {'vs ML Maj':>10} | "
-          f"{'Abstain':>8} | {'Overrides':>10} | {'Net Fix':>8}")
-    print(f"  {'-'*72}")
+          f"{'Overrides':>10} | {'Net Fix':>8}")
+    print(f"  {'-'*58}")
     for llm_name, results in [('Llama', results_llama), ('Qwen', results_qwen), ('GLM', results_glm)]:
-        non_abs    = [r for r in results if not r.get('abstained')]
-        llm_cor    = sum(1 for r in non_abs if r['correct'])
-        llm_acc    = llm_cor / len(non_abs) if non_abs else 0
+        llm_cor    = sum(1 for r in results if r['correct'])
+        llm_acc    = llm_cor / len(results) if results else 0
         delta      = llm_acc - maj_acc
-        overrides  = [r for r in non_abs if r['result'].get('llm_overrode_ml')]
+        overrides  = [r for r in results if r['result'].get('llm_overrode_ml')]
         correct_ov = sum(1 for r in overrides if r['correct'])
         wrong_ov   = len(overrides) - correct_ov
-        n_abs      = len(results) - len(non_abs)
         net_fix    = correct_ov - wrong_ov
-        sign       = "+" if delta >= 0 else ""
         nf_sign    = "+" if net_fix >= 0 else ""
-        print(f"  {llm_name:<12} | {llm_acc:>10.4f} | {sign}{delta:>+9.4f} | "
-              f"{n_abs:>8} | {len(overrides):>10} | {nf_sign}{net_fix:>7}")
+        print(f"  {llm_name:<12} | {llm_acc:>10.4f} | {delta:>+10.4f} | "
+              f"{len(overrides):>10} | {nf_sign}{net_fix:>7}")
 
     # DIFFICULTY ZONE ANALYSIS
     print(f"\n{'='*120}")
@@ -577,6 +557,9 @@ def main():
   - Optimally engineered prompt: forced 6-step reasoning + few-shot anchors
   - Full 6-step reasoning trace persisted per session
   - Stage-1 completeness validation with one retry; deterministic decoding
+  - ALWAYS classifies (no ABSTAIN): unparseable LLM output falls back to the
+    ML majority vote, so every sample is scored over the same denominator N
+  - GLM thinking-channel recovery (no more near-empty responses)
   - ML model TRAINING is unchanged from V23 (by design)
 
   Status: SHAP={'ON' if SHAP_AVAILABLE else 'OFF (pip install shap)'}  |  LIME={'ON' if LIME_AVAILABLE else 'OFF (pip install lime)'}
