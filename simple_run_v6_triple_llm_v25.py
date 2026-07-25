@@ -33,10 +33,20 @@ PRINT_LOCK = threading.Lock()
 
 
 def check_available_models(ollama_url="http://localhost:11434"):
+    """List Ollama models. Handles both old (dict['name']) and new
+    (ListResponse .model attribute) ollama-python APIs."""
     try:
         import ollama
-        models_info = ollama.list()
-        models = [m['name'] for m in models_info['models']]
+        info = ollama.list()
+        raw  = info.get('models', []) if isinstance(info, dict) else getattr(info, 'models', [])
+        models = []
+        for m in raw:
+            if isinstance(m, dict):
+                name = m.get('name') or m.get('model')
+            else:
+                name = getattr(m, 'model', None) or getattr(m, 'name', None)
+            if name:
+                models.append(name)
         print(f"\nAVAILABLE MODELS:")
         for m in models:
             print(f"  {m}")
@@ -214,9 +224,9 @@ def run_classification(agent, emoji, label, selected, df, workers=1):
                 if row['correct']:
                     agent.store_correct_decision_in_ltm(idx, True, row['result'])
     else:
-        # Parallel: memory-off scenarios only (enforced by caller). With the
-        # vLLM backend this engages continuous batching server-side.
-        agent.verbose = False
+        # Parallel: memory-off scenarios only (enforced by caller). The full
+        # V23 per-session trace is still printed — each session is buffered by
+        # the agent and flushed as one contiguous block under the print lock.
         order = {idx: i for i, idx in enumerate(selected)}
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(_classify_one, agent, idx, truths[idx]): idx
@@ -605,17 +615,69 @@ def main():
     default_url = "http://localhost:8000" if backend == 'vllm' else "http://localhost:11434"
     base_url = input(f"Server URL [{default_url}]: ").strip() or default_url
 
+    # Model names per LLM slot (vLLM serves HuggingFace ids, not Ollama tags)
+    model_ids = {'llama': 'llama3:latest',
+                 'glm':   'glm-4.7-flash:latest',
+                 'qwen':  'qwen3.5:latest'}
+
+    if backend == 'vllm':
+        # Pre-flight: vLLM is a separate inference server. It does NOT run
+        # natively on Windows (WSL2 or Docker required) and it serves
+        # HuggingFace model ids — Ollama tags do not exist on it.
+        try:
+            import requests
+            r = requests.get(f"{base_url}/v1/models", timeout=5)
+            r.raise_for_status()
+            served = [m.get('id') for m in r.json().get('data', [])]
+            print(f"\n  vLLM server OK. Served models: {served}")
+            print("  Enter the served model id for each LLM slot:")
+            for k in model_ids:
+                v = input(f"    {k} model id [{model_ids[k]}]: ").strip()
+                if v:
+                    model_ids[k] = v
+        except Exception as e:
+            print(f"\n  [ERROR] No vLLM server reachable at {base_url}")
+            print(f"          ({e})")
+            print("""
+  vLLM was not found running. Notes:
+    - vLLM is a SEPARATE inference server; this script is only its client.
+    - vLLM does not run natively on Windows — it needs WSL2 or Docker:
+        pip install vllm            (inside WSL2/Linux)
+        vllm serve meta-llama/Meta-Llama-3-8B-Instruct --port 8000
+    - vLLM serves HuggingFace model ids; Ollama tags (llama3:latest)
+      do not exist on a vLLM server.
+  On a Windows GPU machine the practical option is Ollama parallelism:
+        setx OLLAMA_NUM_PARALLEL 4     (then restart the Ollama service)
+""")
+            resp = input("  Fall back to the Ollama backend? (yes/no): ").lower().strip()
+            if resp in ('yes', 'y'):
+                backend  = 'ollama'
+                base_url = "http://localhost:11434"
+            else:
+                return
+
     if use_memory:
         workers = 1
         print("\n  LTM is ON — parallel disabled (memory must accumulate in order).")
     else:
+        print("""
+  Parallel workers speed the run up ONLY if the server actually serves
+  concurrent requests. For Ollama you must set this BEFORE starting it:
+      Windows:  setx OLLAMA_NUM_PARALLEL 4     (then restart Ollama)
+  Otherwise requests queue and you see bursts of N finishing together.
+  The full V23 per-session trace is printed either way.""")
         try:
             workers = int(input("Parallel workers (1=sequential, 2-8) [1]: ").strip() or "1")
         except ValueError:
             workers = 1
         workers = max(1, min(8, workers))
         if backend == 'ollama' and workers > 1:
-            print(f"  NOTE: for real gains set OLLAMA_NUM_PARALLEL={workers} on the server.")
+            env_par = os.environ.get('OLLAMA_NUM_PARALLEL')
+            if env_par:
+                print(f"  OLLAMA_NUM_PARALLEL={env_par} detected in this shell.")
+            else:
+                print(f"  [WARN] OLLAMA_NUM_PARALLEL is not set — Ollama will most "
+                      f"likely queue your {workers} workers (bursts of {workers}).")
 
     DATA_PATH = (r"D:\OneDrive - Hamad bin Khalifa University\project 2"
                  r"\ev_mil_framework_corrected\dataset"
@@ -680,7 +742,7 @@ def main():
             use_knowledge=use_knowledge, use_memory=use_memory,
             scenario_tag=f"{scenario_tag}_{model_name.split(':')[0]}",
             xai_store=shared_store,
-            verbose=(workers == 1))
+            verbose=True, print_lock=PRINT_LOCK)
 
     # RUN LLAMA
     print(f"\nMANUAL: make sure llama3:latest is available on the backend")

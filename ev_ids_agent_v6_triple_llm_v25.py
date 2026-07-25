@@ -101,8 +101,8 @@ FEATURE_LABELS = {
 }
 
 # Generation budgets (tokens). V23 sent none => unbounded output.
-STAGE1_MAX_TOKENS = 800
-STAGE2_MAX_TOKENS = 500
+STAGE1_MAX_TOKENS = 900
+STAGE2_MAX_TOKENS = 700
 NUM_CTX           = 8192
 KEEP_ALIVE        = "30m"
 
@@ -778,13 +778,15 @@ class EVIDSAgentV6TripleLLMV25:
 
     def __init__(self, config, llm_client, use_knowledge=True, use_memory=True,
                  scenario_tag="default", xai_store: Optional[XAIStore] = None,
-                 verbose: bool = True):
+                 verbose: bool = True, print_lock=None):
         self.config        = config
         self.llm_client    = llm_client
         self.use_knowledge = use_knowledge
         self.use_memory    = use_memory
         self.scenario_tag  = scenario_tag
         self.verbose       = verbose
+        self.print_lock    = print_lock
+        self._out          = []
         self.df            = pd.read_csv(config['data_path'])
         self.column_mapping = get_column_mapping(self.df)
 
@@ -814,6 +816,17 @@ class EVIDSAgentV6TripleLLMV25:
             self.xai_store = build_xai_store(config, self.df, self.column_mapping,
                                              self.scaler, self.models)
 
+        # Full per-session transcripts (prompts incl. SHAP/LIME evidence +
+        # LLM responses) — explainability is a core contribution, so every
+        # interaction is persisted even when console output is compact.
+        self.transcript_dir = os.path.join(
+            config.get('workspace_dir', './ev_ids_workspace_v6'),
+            'transcripts', scenario_tag)
+        try:
+            os.makedirs(self.transcript_dir, exist_ok=True)
+        except Exception:
+            self.transcript_dir = None
+
     def _load_models(self):
         models = {}
         model_files = {
@@ -837,8 +850,25 @@ class EVIDSAgentV6TripleLLMV25:
         return "QWEN" if "qwen" in n else "GLM" if "glm" in n else "LLAMA" if "llama" in n else "UNKNOWN"
 
     def _log(self, msg):
-        if self.verbose:
-            print(msg)
+        """Buffer one console line for this session.
+
+        The full V23 step-by-step trace (prompts with SHAP/LIME evidence and
+        both LLM responses) is ALWAYS produced — explainability is a core
+        contribution. Buffering keeps each session's block contiguous when
+        several sessions run in parallel.
+        """
+        self._out.append(msg)
+
+    def _flush(self):
+        block = "\n".join(self._out)
+        self._out = []
+        if not self.verbose:
+            return
+        if self.print_lock is not None:
+            with self.print_lock:
+                print(block, flush=True)
+        else:
+            print(block, flush=True)
 
     # ── SYSTEM PROMPT — identical to V23 ───────────────────────────────────────
     def _get_system_prompt(self) -> str:
@@ -1126,7 +1156,12 @@ Provide your structured analysis using the format in your instructions."""
     # ── MAIN DETECT — V23 7-step flow ──────────────────────────────────────────
     def detect(self, line_number):
         t0 = time.time()
+        if   self.use_knowledge and self.use_memory: sc = "A (ML+RAG+LTM+XAI->LLM)"
+        elif self.use_knowledge:                     sc = "B (ML+RAG+XAI->LLM)"
+        elif self.use_memory:                        sc = "C (ML+LTM+XAI->LLM)"
+        else:                                        sc = "D (ML+XAI->LLM baseline)"
         self._log(f"\n[MODEL] {self.llm_client.model_name} -> {self._get_model_type()}")
+        self._log(f"[SCENARIO] {sc}")
         self._log(f"\n{'='*100}\nANALYZING SESSION {line_number}\n{'='*100}\n")
         timestamp = datetime.now().timestamp()
 
@@ -1143,6 +1178,7 @@ Provide your structured analysis using the format in your instructions."""
             "kWhDelivered":    delivered_kwh,
             "label":           int(row[self.column_mapping['label']])
         }
+        self._log(f"  Requested={requested_kwh:.4f}kWh, Delivered={delivered_kwh:.4f}kWh")
 
         # STEP 2: PREPROCESSING
         self._log(f"[Step 2] Preprocessing")
@@ -1183,9 +1219,12 @@ Provide your structured analysis using the format in your instructions."""
             all_predictions[mn] = {'prediction': label, 'confidence': conf}
 
             t_x = time.time()
-            xai_results[mn] = self.xai_store.get(line_number, mn, X_scaled, pidx)
+            xai_r = self.xai_store.get(line_number, mn, X_scaled, pidx)
+            xai_results[mn] = xai_r
             t_xai_total += time.time() - t_x
-            self._log(f"  {mn}: {label} ({conf:.3f})")
+            shap_top = xai_r['shap_values'][0][0] if xai_r.get('shap_ok') and xai_r['shap_values'] else "—"
+            lime_top = xai_r['lime_values'][0][0] if xai_r.get('lime_ok') and xai_r['lime_values'] else "—"
+            self._log(f"  {mn}: {label} ({conf:.3f}) | SHAP top={shap_top} | LIME top={lime_top}")
 
         votes = Counter([p['prediction'] for p in all_predictions.values()])
         self._log(f"  CONSENSUS: {votes.get('Malicious',0)} Attack, "
@@ -1225,16 +1264,24 @@ Provide your structured analysis using the format in your instructions."""
         p1_chars = len(sys_prompt) + len(stage1_prompt)
         p1_words = len(sys_prompt.split()) + len(stage1_prompt.split())
         self._log(f"  Stage 1 prompt: {p1_chars} chars ({p1_words} words)")
+        # V23-style full prompt echo — the SHAP/LIME evidence handed to the LLM
+        # is a core contribution and must be visible for every session.
+        self._log(f"\n  >>> STAGE 1 PROMPT (evidence incl. per-model SHAP/LIME) <<<")
+        self._log(f"  {'-'*80}")
+        for line in stage1_prompt.split('\n'):
+            self._log(f"  > {line}")
+        self._log(f"  {'-'*80}")
 
         t1 = time.time()
         stage1_response = self.llm_client.generate_with_system(
             system_prompt=sys_prompt, user_prompt=stage1_prompt,
             temperature=0.0, max_tokens=STAGE1_MAX_TOKENS)
         latency1 = time.time() - t1
-        if self.verbose:
-            print(f"\n  >>> STAGE 1 RESPONSE ({latency1:.2f}s) <<<")
-            for line in stage1_response.split('\n'):
-                print(f"  | {line}")
+        self._log(f"\n  >>> STAGE 1 RESPONSE ({latency1:.2f}s) <<<")
+        self._log(f"  {'-'*80}")
+        for line in stage1_response.split('\n'):
+            self._log(f"  | {line}")
+        self._log(f"  {'-'*80}")
 
         self._log(f"\n[Step 6b] LLM Stage 2 — Final Decision")
         t2 = time.time()
@@ -1244,14 +1291,37 @@ Provide your structured analysis using the format in your instructions."""
             first_assistant = stage1_response,
             second_user     = self.STAGE2_USER,
             temperature     = 0.0, max_tokens=STAGE2_MAX_TOKENS)
+
+        # Verdict repair: if the response ran out of tokens (or drifted) before
+        # the final 'Prediction:' line, ask explicitly for the one-line verdict
+        # instead of falling back to the ML majority.
+        if "prediction:" not in stage2_response.lower():
+            self._log(f"  [REPAIR] Final verdict line missing — requesting it explicitly")
+            repair = self.llm_client.generate_two_turn(
+                system_prompt   = sys_prompt,
+                first_user      = stage1_prompt,
+                first_assistant = stage1_response + "\n\n" + stage2_response,
+                second_user     = ("Your previous answer did not include the final line. "
+                                   "Reply with ONLY one line, exactly: "
+                                   "'Prediction: Attack' or 'Prediction: Normal'."),
+                temperature=0.0, max_tokens=20)
+            if repair and not repair.startswith("Error:"):
+                stage2_response = stage2_response + "\n" + repair.strip()
+
         latency2  = time.time() - t2
         total_lat = latency1 + latency2
         r2_words  = len(stage2_response.split())
         wps       = round(r2_words / total_lat, 1) if total_lat > 0 else 0
-        if self.verbose:
-            print(f"\n  >>> STAGE 2 RESPONSE ({latency2:.2f}s) <<<")
-            for line in stage2_response.split('\n'):
-                print(f"  | {line}")
+        self._log(f"\n  >>> STAGE 2 PROMPT <<<")
+        self._log(f"  {'-'*80}")
+        for line in self.STAGE2_USER.split('\n'):
+            self._log(f"  > {line}")
+        self._log(f"  {'-'*80}")
+        self._log(f"\n  >>> STAGE 2 RESPONSE ({latency2:.2f}s) <<<")
+        self._log(f"  {'-'*80}")
+        for line in stage2_response.split('\n'):
+            self._log(f"  | {line}")
+        self._log(f"  {'-'*80}")
 
         complexity = {
             "prompt_chars":     p1_chars + len(self.STAGE2_USER),
@@ -1277,10 +1347,63 @@ Provide your structured analysis using the format in your instructions."""
         session_time = time.time() - t0
         final_result['complexity']['session_total_sec'] = round(session_time, 2)
 
-        self._log(f"  CLASSIFICATION:  {final_result['predicted_label']}"
-                  f" | conf={final_result['confidence']:.3f}"
-                  f" | override={'YES' if final_result['llm_overrode_ml'] else 'NO'}"
-                  f" | {session_time:.1f}s")
+        # V23-style detailed final block (explainability surfaced per session)
+        self._log(f"  CLASSIFICATION:  {final_result['predicted_label']}")
+        self._log(f"  Confidence:      {final_result['confidence']:.3f} "
+                  f"(LLM={final_result['llm_confidence']}, "
+                  f"ML_agree={final_result['ml_agreement']:.3f})")
+        self._log(f"  Attack Type:     {final_result['attack_type']}")
+        self._log(f"  LLM overrode ML: {'YES' if final_result['llm_overrode_ml'] else 'NO'} "
+                  f"(ML majority={final_result['ml_majority']})")
+        self._log(f"  Difficulty Zone: {difficulty_zone}")
+        self._log(f"  Time: {session_time:.2f}s total ({total_lat:.2f}s LLM, "
+                  f"{complexity['xai_models_explained']}/7 models explained by XAI)")
+        if final_result.get('llm_xai_assessment'):
+            self._log(f"\n  LLM XAI ASSESSMENT: {final_result['llm_xai_assessment'][:200]}...")
+        if final_result.get('llm_analysis'):
+            self._log(f"  PHYSICAL INTERP:    {final_result['llm_analysis'][:200]}...")
+        if final_result.get('llm_conflicts'):
+            self._log(f"  CONFLICTS:          {final_result['llm_conflicts'][:150]}...")
+        self._log(f"\n{'='*100}\nSESSION {line_number} COMPLETE\n{'='*100}\n")
+
+        # Persist the complete interaction (prompts + SHAP/LIME evidence +
+        # responses + verdict) so explainability survives parallel/quiet runs.
+        if self.transcript_dir:
+            try:
+                transcript = (
+                    f"SESSION {line_number} | model={self.llm_client.model_name} | "
+                    f"scenario={sc} | tag={self.scenario_tag}\n"
+                    f"{'='*100}\n\n"
+                    f"[SYSTEM PROMPT]\n{sys_prompt}\n\n"
+                    f"{'='*100}\n"
+                    f"[STAGE 1 PROMPT — evidence incl. per-model SHAP/LIME]\n"
+                    f"{stage1_prompt}\n\n"
+                    f"{'='*100}\n"
+                    f"[STAGE 1 RESPONSE ({latency1:.2f}s)]\n{stage1_response}\n\n"
+                    f"{'='*100}\n"
+                    f"[STAGE 2 PROMPT]\n{self.STAGE2_USER}\n\n"
+                    f"{'='*100}\n"
+                    f"[STAGE 2 RESPONSE ({latency2:.2f}s)]\n{stage2_response}\n\n"
+                    f"{'='*100}\n"
+                    f"[FINAL DECISION]\n"
+                    f"  predicted_label = {final_result['predicted_label']}\n"
+                    f"  confidence      = {final_result['confidence']}\n"
+                    f"  attack_type     = {final_result['attack_type']}\n"
+                    f"  llm_overrode_ml = {final_result['llm_overrode_ml']}"
+                    f" (ML majority={final_result['ml_majority']})\n"
+                    f"  used_fallback   = {final_result['used_fallback']}\n"
+                    f"  difficulty_zone = {difficulty_zone}\n"
+                    f"  session_time    = {session_time:.2f}s\n"
+                )
+                with open(os.path.join(self.transcript_dir,
+                                       f"session_{line_number}.txt"),
+                          'w', encoding='utf-8') as f:
+                    f.write(transcript)
+            except Exception:
+                pass
+
+        # Emit this session's complete V23-style trace as one contiguous block
+        self._flush()
 
         return {
             'status':            'success',
