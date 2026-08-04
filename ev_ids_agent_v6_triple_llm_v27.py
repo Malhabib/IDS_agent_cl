@@ -623,18 +623,58 @@ class XAIStore:
     disk so scenario re-runs are free.
     """
 
-    def __init__(self, explainer: Optional[XAIExplainer], cache_path: str):
+    @staticmethod
+    def models_fingerprint(models_dir: str) -> str:
+        """
+        Identity of the CURRENT trained ML models.
+
+        SHAP/LIME values depend entirely on the fitted models, but the cache is
+        keyed only by (sample, model_name). If the models are retrained (e.g.
+        a different train ratio) a stale cache would silently feed the LLM
+        explanations computed from the OLD models — corrupting any comparison
+        between runs. The fingerprint detects that and invalidates the cache.
+        """
+        import hashlib
+        h = hashlib.sha256()
+        try:
+            sp = os.path.join(models_dir, 'split_info_v6.pkl')
+            if os.path.exists(sp):
+                with open(sp, 'rb') as f:
+                    si = pickle.load(f)
+                h.update(repr((si.get('train_ratio'), si.get('random_state'),
+                               len(si.get('train_indices', [])),
+                               len(si.get('test_indices', [])))).encode())
+            for fn in sorted(os.listdir(models_dir)):
+                if fn.endswith('.pkl'):
+                    st = os.stat(os.path.join(models_dir, fn))
+                    h.update(f"{fn}:{st.st_size}:{int(st.st_mtime)}".encode())
+        except Exception:
+            return "unknown"
+        return h.hexdigest()[:16]
+
+    def __init__(self, explainer: Optional[XAIExplainer], cache_path: str,
+                 fingerprint: str = ""):
         self.explainer  = explainer
         self.cache_path = cache_path
         self._lock      = threading.Lock()
         self._cache     = {}
+        self.fingerprint = fingerprint
         if cache_path and os.path.exists(cache_path):
             try:
                 with open(cache_path, 'rb') as f:
-                    self._cache = pickle.load(f)
-                n_samples = len({k[0] for k in self._cache})
-                print(f"  [XAI-STORE] Loaded cached explanations "
-                      f"({n_samples} samples, {len(self._cache)} entries)")
+                    blob = pickle.load(f)
+                cached_fp = blob.get('fingerprint') if isinstance(blob, dict) else None
+                entries   = blob.get('entries') if isinstance(blob, dict) else None
+                if entries is None or cached_fp != fingerprint:
+                    print(f"  [XAI-STORE] Cache is from a different set of trained "
+                          f"models — discarding and recomputing "
+                          f"(cached={cached_fp}, current={fingerprint})")
+                    self._cache = {}
+                else:
+                    self._cache = entries
+                    n_samples = len({k[0] for k in self._cache})
+                    print(f"  [XAI-STORE] Loaded cached explanations "
+                          f"({n_samples} samples, {len(self._cache)} entries)")
             except Exception:
                 self._cache = {}
 
@@ -658,7 +698,8 @@ class XAIStore:
             return
         try:
             with open(self.cache_path, 'wb') as f:
-                pickle.dump(self._cache, f)
+                pickle.dump({'fingerprint': self.fingerprint,
+                             'entries': self._cache}, f)
         except Exception as e:
             print(f"  [XAI-STORE] save failed: {e}")
 
@@ -696,7 +737,9 @@ def build_xai_store(config: dict, df: pd.DataFrame, column_mapping: dict,
         explainer  = XAIExplainer(models, bg_scaled, FEATURE_NAMES, n_kernel_bg=30)
         cache_path = os.path.join(
             config.get('workspace_dir', './ev_ids_workspace_v6'), 'xai_cache_v27.pkl')
-        return XAIStore(explainer, cache_path)
+        fp = XAIStore.models_fingerprint(config['models_dir'])
+        print(f"  [XAI] Model fingerprint: {fp}")
+        return XAIStore(explainer, cache_path, fingerprint=fp)
     except Exception as e:
         print(f"  [XAI] store init failed: {e}")
         return XAIStore(None, "")
