@@ -116,7 +116,16 @@ STAGE1_MAX_TOKENS = None      # None => unbounded, exactly like V23
 STAGE2_MAX_TOKENS = None
 LLM_TEMPERATURE   = None      # None => Ollama default, exactly like V23
 NUM_CTX           = 8192      # only enlarges the window; never truncates
-KEEP_ALIVE        = "30m"     # quality-neutral: avoids reload between calls
+# keep_alive: how long Ollama keeps a model resident after a request.
+# V27 used "30m", which was a serious mistake for a THREE-model study: the
+# runner works through Llama -> GLM -> Qwen, so with a 30-minute hold all
+# three models stay pinned in VRAM simultaneously. Once VRAM is exhausted
+# Ollama offloads layers to CPU, and per-token throughput collapses:
+#     V26 (short hold): Llama 2.22 w/s, Qwen 0.57 w/s, GLM 1.86 w/s
+#     V27 (30m hold):   Llama 0.29 w/s, Qwen 0.07 w/s, GLM 0.34 w/s   ~8x slower
+# A short hold keeps the CURRENT model warm between its own sessions while
+# letting the previous model be evicted before the next one loads.
+KEEP_ALIVE        = "5m"
 REPAIR_MAX_TOKENS = 24        # tiny follow-up that asks only for the verdict
 
 # ── PER-MODEL GENERATION POLICY (V27) ────────────────────────────────────────
@@ -406,6 +415,22 @@ class VLLMClient:
                 temperature, max_tokens)
         except Exception as e:
             return f"Error: {str(e)}"
+
+
+def unload_ollama_model(model_name: str, base_url: str = "http://localhost:11434"):
+    """
+    Force Ollama to evict a model from VRAM (keep_alive=0).
+
+    Called when the runner switches to the next LLM so the incoming model gets
+    the whole GPU instead of competing with the previous one.
+    """
+    try:
+        import requests
+        requests.post(f"{base_url.rstrip('/')}/api/generate",
+                      json={'model': model_name, 'keep_alive': 0}, timeout=30)
+        print(f"  [VRAM] Unloaded {model_name}")
+    except Exception as e:
+        print(f"  [VRAM] Could not unload {model_name}: {e}")
 
 
 def make_llm_client(backend: str, model_name: str, base_url: str,
@@ -923,6 +948,10 @@ class EVIDSAgentV6TripleLLMV27:
         self.scenario_tag  = scenario_tag
         self.verbose       = verbose
         self.print_lock    = print_lock
+        # Decoding temperature for this agent. None => the client's own value
+        # (which the temperature sweep sets per run). Must NOT be hard-coded in
+        # detect(), or the sweep silently evaluates one temperature five times.
+        self.temperature   = getattr(llm_client, 'temperature', None)
         self._out          = []
         self.df            = pd.read_csv(config['data_path'])
         self.column_mapping = get_column_mapping(self.df)
@@ -985,6 +1014,17 @@ class EVIDSAgentV6TripleLLMV27:
     def _get_model_type(self):
         n = self.llm_client.model_name.lower()
         return "QWEN" if "qwen" in n else "GLM" if "glm" in n else "LLAMA" if "llama" in n else "UNKNOWN"
+
+    def _repair_budget(self) -> int:
+        """Token budget for the verdict-repair call.
+
+        A thinking model spends num_predict on its reasoning channel before it
+        writes any content, so a 24-token repair budget guarantees an empty
+        answer. Thinking models therefore need room to think AND answer.
+        """
+        if getattr(self.llm_client, 'thinking_capable', False):
+            return 1024
+        return REPAIR_MAX_TOKENS
 
     def _log(self, msg):
         """Buffer one console line for this session.
@@ -1425,7 +1465,7 @@ Provide your structured analysis using the format in your instructions."""
         t1 = time.time()
         stage1_response = self.llm_client.generate_with_system(
             system_prompt=sys_prompt, user_prompt=stage1_prompt,
-            temperature=0.0, max_tokens=STAGE1_MAX_TOKENS)
+            temperature=self.temperature, max_tokens=STAGE1_MAX_TOKENS)
         latency1 = time.time() - t1
         self._log(f"\n  >>> STAGE 1 RESPONSE ({latency1:.2f}s) <<<")
         self._log(f"  {'-'*80}")
@@ -1440,7 +1480,7 @@ Provide your structured analysis using the format in your instructions."""
             first_user      = stage1_prompt,
             first_assistant = stage1_response,
             second_user     = self.STAGE2_USER,
-            temperature     = 0.0, max_tokens=STAGE2_MAX_TOKENS)
+            temperature     = self.temperature, max_tokens=STAGE2_MAX_TOKENS)
 
         # Verdict repair (V26): only when no verdict can be extracted at all.
         # Recovers sessions V23 would have thrown away as ABSTAIN.
@@ -1455,7 +1495,7 @@ Provide your structured analysis using the format in your instructions."""
                 second_user     = ("Your previous answer did not state the final line. "
                                    "Reply with ONLY one line, exactly: "
                                    "'Prediction: Attack' or 'Prediction: Normal'."),
-                temperature=0.0, max_tokens=REPAIR_MAX_TOKENS)
+                temperature=0.0, max_tokens=self._repair_budget())
             if repair and not repair.startswith("Error:"):
                 stage2_response = stage2_response + "\n" + repair.strip()
                 self._log(f"  [REPAIR] Recovered: {repair.strip()[:60]}")

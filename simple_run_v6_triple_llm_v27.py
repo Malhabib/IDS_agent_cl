@@ -30,6 +30,7 @@ from llm_eval_metrics_v27 import (
 )
 from ev_ids_agent_v6_triple_llm_v27 import (
     make_llm_client, EVIDSAgentV6TripleLLMV27, build_xai_store,
+    unload_ollama_model,
     auto_train_models_v6, get_column_mapping, classify_difficulty_zone,
     parse_datetime_to_timestamp, SHAP_AVAILABLE, LIME_AVAILABLE
 )
@@ -710,6 +711,8 @@ def run_temperature_sweep(config, backend, base_url, scenario_tag,
     for slot, model_name in model_ids.items():
         sweep[slot] = {}
         for t in temps:
+            if backend == 'ollama':
+                unload_ollama_model(model_name, base_url)
             print(f"\n--- {slot} @ temperature={t} ---")
             client = make_llm_client(backend, model_name, base_url, temperature=t)
             agent  = EVIDSAgentV6TripleLLMV27(
@@ -925,8 +928,17 @@ RUN MODE
             except ValueError:
                 pass
         print(f"  Sweep temperatures: {temps}")
-        print(f"  NOTE: cost = len(temps) x 3 models x n sessions. Use a smaller")
-        print(f"        n for the sweep than for the main run.")
+        # COST GUARD: the V27 run swept 5 temps x 3 models x 50 sessions = 750
+        # extra sessions, five times the main run, which is what turned this
+        # into a multi-day job. Default the sweep to a subset.
+        try:
+            sweep_n = int(input(f"  Sessions per sweep cell "
+                                f"(<= main run n) [20]: ").strip() or "20")
+        except ValueError:
+            sweep_n = 20
+        sweep_n = max(10, sweep_n)
+        print(f"  Sweep cost: {len(temps)} temps x 3 models x {sweep_n} sessions "
+              f"= {len(temps)*3*sweep_n} sessions")
 
     DATA_PATH = (r"D:\OneDrive - Hamad bin Khalifa University\project 2"
                  r"\ev_mil_framework_corrected\dataset"
@@ -1004,7 +1016,9 @@ RUN MODE
                                         selected, df, workers=workers)
     shared_store.save()
 
-    # RUN GLM
+    # RUN GLM — free the previous model's VRAM first so GLM gets the whole GPU
+    if backend == 'ollama':
+        unload_ollama_model(model_ids["llama"], base_url)
     print(f"\nMANUAL: switch to glm-4.7-flash:latest")
     agent_glm = make_agent(model_ids["glm"])
     if use_memory and agent_glm.ltm:
@@ -1014,7 +1028,9 @@ RUN MODE
                                       selected, df, workers=workers)
     shared_store.save()
 
-    # RUN QWEN
+    # RUN QWEN — free the previous model's VRAM first
+    if backend == 'ollama':
+        unload_ollama_model(model_ids["glm"], base_url)
     print(f"\nMANUAL: switch to qwen3.5:latest")
     agent_qwen = make_agent(model_ids["qwen"])
     if use_memory and agent_qwen.ltm:
@@ -1033,7 +1049,8 @@ RUN MODE
     if run_mode in ("2", "3"):
         run_temperature_sweep(config, backend, base_url, scenario_tag,
                               use_knowledge, use_memory, shared_store,
-                              selected, df, temps, model_ids, results_dir, sc_k)
+                              selected[:sweep_n], df, temps, model_ids,
+                              results_dir, sc_k)
 
     ts           = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_file = os.path.join(results_dir, f"triple_llm_v6_v27_{scenario_tag}_{ts}.json")
