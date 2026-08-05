@@ -112,7 +112,12 @@ FEATURE_LABELS = {
 # cache + keep_alive), never from throttling the model.
 STAGE1_MAX_TOKENS = None      # None => unbounded, exactly like V23
 STAGE2_MAX_TOKENS = None
-LLM_TEMPERATURE   = None      # None => Ollama default, exactly like V23
+# Measured on the identical 50-session stratified sample:
+#     T=0.0            -> Llama 0.72  Qwen 0.78  GLM 0.68
+#     Ollama default   -> Llama 0.58  Qwen 0.70  GLM 0.60
+# Greedy decoding is materially better for this task, so it is the default.
+# The temperature sweep overrides this per cell.
+LLM_TEMPERATURE   = 0.0
 NUM_CTX           = 8192      # only enlarges the window; never truncates
 # keep_alive: how long Ollama keeps a model resident after a request.
 # V27 used "30m", which was a serious mistake for a THREE-model study: the
@@ -980,10 +985,15 @@ class EVIDSAgentV6TripleLLMV28:
     def __init__(self, config, llm_client, use_knowledge=True, use_memory=True,
                  scenario_tag="default", xai_store: Optional[XAIStore] = None,
                  verbose: bool = True, print_lock=None,
-                 self_consistency_k: int = 1):
+                 self_consistency_k: int = 1, use_xai: bool = True):
         self.config             = config
         self.llm_client         = llm_client
         self.self_consistency_k = max(1, self_consistency_k)
+        # use_xai=False removes the SHAP/LIME blocks from the prompt (models
+        # still show prediction + confidence, as in V20/V22). Everything else
+        # -- prompts, flow, scenarios, display -- is identical, so with/without
+        # runs on the same samples isolate the XAI contribution exactly.
+        self.use_xai            = use_xai
         self.use_knowledge = use_knowledge
         self.use_memory    = use_memory
         self.scenario_tag  = scenario_tag
@@ -992,7 +1002,8 @@ class EVIDSAgentV6TripleLLMV28:
         # Decoding temperature for this agent. None => the client's own value
         # (which the temperature sweep sets per run). Must NOT be hard-coded in
         # detect(), or the sweep silently evaluates one temperature five times.
-        self.temperature   = getattr(llm_client, 'temperature', None)
+        _client_temp = getattr(llm_client, 'temperature', None)
+        self.temperature = _client_temp if _client_temp is not None else LLM_TEMPERATURE
         self._out          = []
         self.df            = pd.read_csv(config['data_path'])
         self.column_mapping = get_column_mapping(self.df)
@@ -1229,25 +1240,35 @@ Prediction: [Attack or Normal]"""
         evidence += "  Compute the delivery ratio (delivered / requested) yourself\n"
         evidence += "  as part of your physical interpretation.\n\n"
 
-        evidence += "=" * 60 + "\n"
-        evidence += "ML CLASSIFIER PREDICTIONS WITH SHAP + LIME EXPLANATIONS\n"
-        evidence += "=" * 60 + "\n"
-        evidence += (
-            "Each model shows:\n"
-            "  - Its prediction and confidence score\n"
-            "  - SHAP values: how much each feature contributed (+= toward Attack)\n"
-            "  - LIME weights: local linear approximation of its decision\n\n"
-        )
         votes = Counter([p['prediction'] for p in all_predictions.values()])
-        for mn, pred in all_predictions.items():
-            xai_r = xai_results.get(mn, dict(_EMPTY_XAI))
-            evidence += self._format_xai_for_prompt(
-                mn, xai_r, pred['prediction'], pred['confidence'])
-            evidence += "\n\n"
+        evidence += "=" * 60 + "\n"
+        if self.use_xai:
+            evidence += "ML CLASSIFIER PREDICTIONS WITH SHAP + LIME EXPLANATIONS\n"
+            evidence += "=" * 60 + "\n"
+            evidence += (
+                "Each model shows:\n"
+                "  - Its prediction and confidence score\n"
+                "  - SHAP values: how much each feature contributed (+= toward Attack)\n"
+                "  - LIME weights: local linear approximation of its decision\n\n"
+            )
+            for mn, pred in all_predictions.items():
+                xai_r = xai_results.get(mn, dict(_EMPTY_XAI))
+                evidence += self._format_xai_for_prompt(
+                    mn, xai_r, pred['prediction'], pred['confidence'])
+                evidence += "\n\n"
+        else:
+            # XAI ABLATION: predictions + confidence only, no SHAP/LIME.
+            evidence += "ML CLASSIFIER PREDICTIONS\n"
+            evidence += "=" * 60 + "\n"
+            for mn, pred in all_predictions.items():
+                evidence += (f"  {mn}: {pred['prediction']} "
+                             f"({pred['confidence']*100:.1f}%)\n")
+            evidence += "\n"
 
         evidence += f"Vote tally: {votes.get('Malicious',0)} Attack, {votes.get('Normal',0)} Normal\n"
-        evidence += ("Note: use the SHAP/LIME explanations to assess each model's "
-                     "credibility, not just its vote.\n")
+        if self.use_xai:
+            evidence += ("Note: use the SHAP/LIME explanations to assess each model's "
+                         "credibility, not just its vote.\n")
 
         return f"""Analyze this session. Do NOT give a final prediction yet — only your analysis.
 
@@ -1365,7 +1386,8 @@ Provide your structured analysis using the format in your instructions."""
             "duration_hours":       round(duration_hours, 2),
             "knowledge_used":       self.use_knowledge,
             "memory_used":          self.use_memory,
-            "xai_used":             self.xai_store.explainer is not None,
+            "xai_used":             self.use_xai and self.xai_store.explainer is not None,
+            "xai_enabled":          self.use_xai,
             "shap_available":       SHAP_AVAILABLE,
             "lime_available":       LIME_AVAILABLE,
             "ltm_cases_referenced": len(ltm_cases),

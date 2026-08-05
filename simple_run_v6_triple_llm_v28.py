@@ -419,8 +419,10 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
     print(f"\n{'='*160}")
     print(f"TRIPLE LLM COMPARISON — VERSION 6 V28 (SHAP+LIME, always-classify) | {sc_label}")
     print(f"{'='*160}")
+    xai_on = results_llama[0]['result'].get('xai_enabled', True) if results_llama else True
     print(f"  SHAP: {'ON' if SHAP_AVAILABLE else 'OFF'}  |  "
-          f"LIME: {'ON' if LIME_AVAILABLE else 'OFF'}")
+          f"LIME: {'ON' if LIME_AVAILABLE else 'OFF'}  |  "
+          f"XAI IN PROMPT: {'ON' if xai_on else 'OFF (ablation)'}")
 
     model_map = {'Random Forest': 'RF', 'Logistic Regression': 'LR',
                  'K-Nearest Neighbors': 'KNN', 'MLP': 'MLP',
@@ -712,7 +714,8 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
 
 def run_temperature_sweep(config, backend, base_url, scenario_tag,
                           use_knowledge, use_memory, shared_store,
-                          selected, df, temps, model_ids, results_dir, sc_k):
+                          selected, df, temps, model_ids, results_dir, sc_k,
+                          use_xai=True):
     """
     Effect of decoding temperature on accuracy across LLM models.
 
@@ -736,7 +739,7 @@ def run_temperature_sweep(config, backend, base_url, scenario_tag,
                 config, client, use_knowledge=use_knowledge, use_memory=use_memory,
                 scenario_tag=f"{scenario_tag}_{slot}_T{t}",
                 xai_store=shared_store, verbose=False, print_lock=PRINT_LOCK,
-                self_consistency_k=1)   # k=1: isolate the temperature effect
+                self_consistency_k=1, use_xai=use_xai)   # k=1: isolate the temperature effect
             rows = []
             for idx in selected:
                 gt  = "Malicious" if df.loc[idx, 'label'] == 1 else "Normal"
@@ -824,7 +827,29 @@ def main():
     use_memory    = sc['use_memory']
     scenario_tag  = sc['tag']
     print(f"\n  Scenario {choice}: {sc['desc']}")
-    print(f"  RAG={'ON' if use_knowledge else 'OFF'}, LTM={'ON' if use_memory else 'OFF'}, XAI=ON")
+
+    # ── XAI ABLATION ──────────────────────────────────────────────────────
+    print("""
+============================================================
+XAI (SHAP + LIME) — ABLATION SWITCH
+============================================================
+  ON  : each ML model is shown with its SHAP contributions and LIME weights
+  OFF : each ML model is shown with prediction + confidence only
+
+  Everything else is identical -- same prompts, same 7-step flow, same
+  samples, same display. Running the SAME samples once with ON and once
+  with OFF isolates the contribution of SHAP/LIME exactly.
+
+  NOTE: SHAP/LIME here are computed on deliberately underfit models, so
+  their attributions can be uninformative or misleading. Measuring this
+  is the point of the switch.
+""")
+    xai_in   = input("  XAI (on/off) [on]: ").strip().lower() or "on"
+    use_xai  = xai_in not in ("off", "no", "n", "0")
+    scenario_tag = f"{scenario_tag}_{'XAIon' if use_xai else 'XAIoff'}"
+    print(f"  RAG={'ON' if use_knowledge else 'OFF'}, "
+          f"LTM={'ON' if use_memory else 'OFF'}, "
+          f"XAI={'ON' if use_xai else 'OFF'}")
 
     # BACKEND + PARALLELISM
     print("\n" + "=" * 60)
@@ -1021,7 +1046,7 @@ RUN MODE
             scenario_tag=f"{scenario_tag}_{model_name.split(':')[0]}",
             xai_store=shared_store,
             verbose=True, print_lock=PRINT_LOCK,
-            self_consistency_k=sc_k)
+            self_consistency_k=sc_k, use_xai=use_xai)
 
     # RUN LLAMA
     print(f"\nMANUAL: make sure llama3:latest is available on the backend")
@@ -1067,7 +1092,7 @@ RUN MODE
         run_temperature_sweep(config, backend, base_url, scenario_tag,
                               use_knowledge, use_memory, shared_store,
                               selected[:sweep_n], df, temps, model_ids,
-                              results_dir, sc_k)
+                              results_dir, sc_k, use_xai=use_xai)
 
     ts           = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_file = os.path.join(results_dir, f"triple_llm_v6_v28_{scenario_tag}_{ts}.json")
@@ -1080,6 +1105,7 @@ RUN MODE
                 'workers':       workers,
                 'use_knowledge': use_knowledge,
                 'use_memory':    use_memory,
+                'use_xai':       use_xai,
                 'shap_used':     SHAP_AVAILABLE,
                 'lime_used':     LIME_AVAILABLE,
                 'timestamp':     ts,
