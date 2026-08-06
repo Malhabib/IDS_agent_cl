@@ -538,12 +538,25 @@ class XAIExplainer:
                 else:
                     raw = explainer.shap_values(X_scaled)
 
+                # SIGN CONVENTION (fixed here; wrong since V23).
+                # The prompt states "+ = toward Attack", so the attribution
+                # MUST be taken with respect to the Attack class. Earlier
+                # versions indexed by the PREDICTED class instead. For binary
+                # classification the two classes' Shapley values are mirror
+                # images, so every model that predicted Normal had its
+                # direction inverted: the prompt announced "toward Attack" for
+                # evidence that actually pointed toward Normal. Because
+                # MLP/SVC/GB predict Normal on every session, most SHAP blocks
+                # in every prompt were sign-flipped toward Attack, which is
+                # what drove the false-alarm rate to 0.42-0.45.
+                ATTACK_CLASS = 1
                 if isinstance(raw, list):
-                    idx = min(predicted_class_idx, len(raw) - 1)
+                    idx = min(ATTACK_CLASS, len(raw) - 1)
                     sv  = np.array(raw[idx]).flatten()
                 elif isinstance(raw, np.ndarray):
                     if raw.ndim == 3:
-                        sv = raw[0, :, predicted_class_idx]
+                        idx = min(ATTACK_CLASS, raw.shape[2] - 1)
+                        sv  = raw[0, :, idx]
                     elif raw.ndim == 2:
                         sv = raw[0]
                     else:
@@ -582,13 +595,15 @@ class XAIExplainer:
                         p = 1 / (1 + np.exp(-d))
                         return np.column_stack([1 - p, p])
 
+                # Same convention as SHAP: weights are reported against the
+                # Attack class so "supports Attack" is literally true.
                 exp = self.lime_explainer.explain_instance(
                     X_scaled[0], pred_fn,
                     num_features = len(self.feature_names),
                     num_samples  = self.lime_num_samples,
-                    labels       = (predicted_class_idx,)
+                    labels       = (1,)
                 )
-                lime_list = exp.as_list(label=predicted_class_idx)
+                lime_list = exp.as_list(label=1)
                 lime_entries = []
                 for condition, weight in lime_list:
                     matched_label = condition
