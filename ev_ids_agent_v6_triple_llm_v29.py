@@ -498,8 +498,42 @@ class XAIExplainer:
         self.kernel_bg = shap.sample(background_X, n) if SHAP_AVAILABLE else background_X[:n]
         self.shap_explainers = {}
         self.lime_explainer  = None
+        self.informative     = {}     # model -> does its SHAP vary per session?
         self._init_shap()
         self._init_lime()
+        self._profile_informativeness()
+
+    def _profile_informativeness(self, n_probe: int = 12, tol: float = 1e-6):
+        """
+        Flag models whose SHAP attribution is effectively CONSTANT.
+
+        A depth-1 stump splits once on one feature, so its Shapley attribution
+        is the same for every session. Presenting such an explanation as
+        per-session evidence injects a constant into every prompt while the
+        system prompt instructs the LLM to weight explanations above the votes
+        -- i.e. it substitutes noise for signal. Models detected here are
+        reported as uninformative instead of being dressed up as evidence.
+        """
+        if not SHAP_AVAILABLE or len(self.background_X) < 2:
+            return
+        probe = self.background_X[:min(n_probe, len(self.background_X))]
+        for name in self.models:
+            if name not in self.shap_explainers:
+                continue
+            try:
+                tops = []
+                for row in probe:
+                    r = self.explain_model(name, row.reshape(1, -1), 1)
+                    if r.get('shap_ok') and r['shap_values']:
+                        tops.append(r['shap_values'][0][1])
+                if len(tops) >= 2:
+                    varies = float(np.std(tops)) > tol
+                    self.informative[name] = varies
+                    if not varies:
+                        print(f"  [XAI] {name}: attribution is CONSTANT across "
+                              f"sessions -> will be reported as uninformative")
+            except Exception:
+                self.informative[name] = True
 
     def _init_shap(self):
         if not SHAP_AVAILABLE:
@@ -1173,12 +1207,21 @@ HOW TO REASON:
 - Weigh all evidence and arrive at your own independent conclusion
 
 CRITICAL RULES:
-- Never treat ML vote counts as the final answer
-- SHAP/LIME explanations are more informative than the vote alone —
-  a model that voted Attack because of high delivered energy is more
-  credible than one that voted Attack because of connection timing
-- If SHAP/LIME explanations are inconsistent across models, note which
-  models have physically meaningful explanations and weight those more
+- A model's VOTE is its conclusion; its SHAP/LIME explanation shows WHAT DROVE
+  that conclusion. Use the explanation to judge how much the vote deserves,
+  not as a substitute for it.
+- A vote driven by the energy features (requested / delivered) is credible.
+  A vote driven by connection or disconnect timing is suspect, because timing
+  has no physical bearing on whether energy was stolen.
+- Some explanations are marked UNINFORMATIVE. Those models use a single fixed
+  rule, so their attribution is the same for every session and tells you
+  nothing about THIS one. Ignore their explanation and use their vote only.
+- If most explanations are uninformative or point in conflicting directions,
+  fall back on the physical evidence: the delivery ratio you computed and the
+  overall balance of votes. Do not let a weak explanation override a clear
+  physical reading.
+- Never treat the raw vote count alone as the final answer, and never treat a
+  single explanation as decisive.
 - Explain your reasoning so another analyst can follow it
 
 STAGE 1 FORMAT (analysis only — no final prediction yet):
@@ -1221,20 +1264,26 @@ Prediction: [Attack or Normal]"""
                                prediction: str, confidence: float) -> str:
         lines = [f"  {model_name}: {prediction} ({confidence*100:.1f}%)"]
 
+        if xai_result.get('shap_ok') and not xai_result.get('informative', True):
+            lines.append("    SHAP/LIME: UNINFORMATIVE for this model — it applies a "
+                         "single fixed split,")
+            lines.append("               so its attribution is identical for every "
+                         "session. Judge this")
+            lines.append("               model on its vote and confidence only.")
+            return "\n".join(lines)
+
         if xai_result.get('shap_ok') and xai_result['shap_values']:
             lines.append("    SHAP — feature contributions to this prediction:")
             for fname, val, direction in xai_result['shap_values'][:3]:
                 bar = "#" * min(int(abs(val) * 20), 10)
-                sign = "+" if val >= 0 else ""
-                lines.append(f"      {fname:<28} {sign}{val:+.3f}  {bar}  ({direction})")
+                lines.append(f"      {fname:<28} {val:+.3f}  {bar}  ({direction})")
         else:
             lines.append("    SHAP: unavailable")
 
         if xai_result.get('lime_ok') and xai_result['lime_values']:
             lines.append("    LIME — local decision boundary:")
             for fname, condition, weight, direction in xai_result['lime_values'][:3]:
-                sign = "+" if weight >= 0 else ""
-                lines.append(f"      {condition:<35} weight={sign}{weight:.3f}  ({direction})")
+                lines.append(f"      {condition:<35} weight={weight:+.3f}  ({direction})")
         else:
             lines.append("    LIME: unavailable")
 
