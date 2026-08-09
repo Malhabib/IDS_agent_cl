@@ -171,7 +171,11 @@ DEFAULT_GEN_POLICY = {
 MODEL_GEN_POLICY = {
     # substring matched against the model name (lowercased)
     'qwen': {'num_predict': 3072, 'repeat_penalty': 1.10, 'thinking': True},
-    'glm':  {'num_predict': 2048, 'repeat_penalty': 1.20, 'thinking': True},
+    # GLM measured at ~2,753 words/session against a 2,048-token cap
+    # (~1,500 words/stage): it was being truncated BEFORE emitting the verdict
+    # line, which is why format compliance sat at 0.26 with 28/50 fallbacks.
+    # It needs room to think AND answer.
+    'glm':  {'num_predict': 4096, 'repeat_penalty': 1.20, 'thinking': True},
     'llama': {'num_predict': 2048, 'repeat_penalty': 1.15, 'thinking': False},
 }
 
@@ -1106,7 +1110,7 @@ class EVIDSAgentV6TripleLLMV29:
         answer. Thinking models therefore need room to think AND answer.
         """
         if getattr(self.llm_client, 'thinking_capable', False):
-            return 1024
+            return 2048          # thinking burns the budget before answering
         return REPAIR_MAX_TOKENS
 
     def _log(self, msg):
