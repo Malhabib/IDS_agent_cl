@@ -1400,19 +1400,11 @@ Provide your structured analysis using the format in your instructions."""
         if m2:
             conflicts_text = m2.group(1).strip()
 
-        xai_assessment = ""
-        m3 = re.search(
-            r'shap_lime_assessment:\s*\n(.*?)(?=\ndomain_match:|\nhistorical|\Z)',
-            stage1_response, re.DOTALL | re.IGNORECASE)
-        if m3:
-            xai_assessment = m3.group(1).strip()
+        xai_assessment = _section("SHAP_LIME_ASSESSMENT", stage1_response,
+                                  ["DOMAIN_MATCH", "HISTORICAL"])
 
-        physical_interp = ""
-        m4 = re.search(
-            r'physical_interpretation:\s*\n(.*?)(?=\nshap_lime|\ndomain_match:|\Z)',
-            stage1_response, re.DOTALL | re.IGNORECASE)
-        if m4:
-            physical_interp = m4.group(1).strip()
+        physical_interp = _section("PHYSICAL_INTERPRETATION", stage1_response,
+                                   ["SHAP_LIME", "DOMAIN_MATCH"])
 
         # Always-classify fallback: tone inference, then ML majority (no ABSTAIN)
         ml_majority = votes.most_common(1)[0][0] if votes else 'Normal'
