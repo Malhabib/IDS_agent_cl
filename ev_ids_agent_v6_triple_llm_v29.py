@@ -249,6 +249,26 @@ _VERDICT_RE = re.compile(
     re.IGNORECASE)
 
 
+def extract_section(name: str, text: str, stops: List[str]) -> str:
+    """
+    Pull a named section out of an LLM response.
+
+    The original patterns required a newline immediately after the header, so a
+    model writing "SHAP_LIME_ASSESSMENT: the delivered energy ..." on one line,
+    or emphasising it as "**SHAP_LIME_ASSESSMENT:**", parsed as absent. That is
+    what drove the XAI-reference count to 0/50 while XAI faithfulness stayed at
+    1.00 on the same responses — a reporting artefact, not a change in model
+    behaviour. Markdown emphasis, heading markers and same-line content are all
+    tolerated here.
+    """
+    if not text:
+        return ""
+    stop = "|".join(rf"\n\s*\**\s*#*\s*{t}" for t in stops) or r"\Z"
+    pat = rf"\**\s*#*\s*{name}\s*\**\s*:\s*\**\s*(.*?)(?={stop}|\Z)"
+    m = re.search(pat, text, re.DOTALL | re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
 def extract_verdict(text: str) -> Optional[str]:
     """
     Robustly pull the final Normal/Attack verdict out of an LLM response.
@@ -1106,6 +1126,8 @@ class EVIDSAgentV6TripleLLMV29:
         # Full per-session transcripts (prompts incl. SHAP/LIME evidence +
         # LLM responses) — explainability is a core contribution, so every
         # interaction is persisted even when console output is compact.
+        self.constant_models = self._profile_constant_models()
+
         self.transcript_dir = os.path.join(
             config.get('workspace_dir', './ev_ids_workspace_v6'),
             'transcripts', scenario_tag)
@@ -1113,6 +1135,46 @@ class EVIDSAgentV6TripleLLMV29:
             os.makedirs(self.transcript_dir, exist_ok=True)
         except Exception:
             self.transcript_dir = None
+
+    def _profile_constant_models(self, n_probe: int = 200):
+        """
+        Identify classifiers that emit the SAME class for every session.
+
+        Measured on this dataset, MLP, SVC and Gradient Boosting never predict
+        Attack. Their vote is a constant, but each still occupies a line in the
+        prompt and a share of the vote tally, so on a genuine attack the tally
+        can read "2 Attack, 5 Normal" -- a majority-Normal signal on a real
+        attack. Any LLM that defers to the tally inherits that bias: Llama
+        agreed with the ensemble on 84% of sessions and missed 9 attacks, while
+        Qwen largely ignored it and missed none. Flagging these models lets the
+        prompt state plainly that their vote carries no information.
+        """
+        constant = set()
+        try:
+            split_path = os.path.join(self.config['models_dir'], 'split_info_v6.pkl')
+            if not os.path.exists(split_path):
+                return constant
+            with open(split_path, 'rb') as f:
+                train_idx = pickle.load(f)['train_indices']
+            cm = self.column_mapping
+            cols = [cm[c] for c in ['connectionTime', 'disconnectTime',
+                                    'RequestedDemand', 'kWhDelivered']]
+            probe = self.df.loc[train_idx[:n_probe], cols].copy()
+            probe.columns = FEATURE_NAMES
+            for c in ['connectionTime', 'disconnectTime']:
+                probe[c] = probe[c].apply(parse_datetime_to_timestamp)
+            Xp = self.scaler.transform(probe.fillna(0).values)
+            for name, m in self.models.items():
+                preds = set(np.asarray(m.predict(Xp)).ravel().tolist())
+                if len(preds) < 2:
+                    constant.add(name)
+            if constant:
+                print(f"  [ML] Non-discriminating classifiers (single class on "
+                      f"{len(Xp)} training sessions): {', '.join(sorted(constant))}")
+                print(f"       Their votes will be marked as carrying no information.")
+        except Exception as e:
+            print(f"  [ML] constant-model profiling skipped: {e}")
+        return constant
 
     def _load_models(self):
         models = {}
@@ -1216,10 +1278,14 @@ CRITICAL RULES:
 - Some explanations are marked UNINFORMATIVE. Those models use a single fixed
   rule, so their attribution is the same for every session and tells you
   nothing about THIS one. Ignore their explanation and use their vote only.
-- If most explanations are uninformative or point in conflicting directions,
-  fall back on the physical evidence: the delivery ratio you computed and the
-  overall balance of votes. Do not let a weak explanation override a clear
-  physical reading.
+- Some classifiers are marked NON-DISCRIMINATING: they output the same class
+  for every session, so their vote is a constant and tells you nothing about
+  THIS session. Exclude them from your reasoning and use the DISCRIMINATING
+  vote tally where one is given.
+- The delivery ratio you computed from the raw measurements is the single most
+  reliable piece of evidence available to you. It OUTRANKS the vote tally. A
+  ratio far above 1.0 indicates energy theft even if most classifiers voted
+  Normal — several of them are known to miss attacks.
 - Never treat the raw vote count alone as the final answer, and never treat a
   single explanation as decisive.
 - Explain your reasoning so another analyst can follow it
@@ -1261,8 +1327,11 @@ Prediction: [Attack or Normal]"""
     # ── FORMAT XAI FOR PROMPT — identical to V23 ───────────────────────────────
     @staticmethod
     def _format_xai_for_prompt(model_name: str, xai_result: Dict,
-                               prediction: str, confidence: float) -> str:
-        lines = [f"  {model_name}: {prediction} ({confidence*100:.1f}%)"]
+                               prediction: str, confidence: float,
+                               is_constant: bool = False) -> str:
+        tag = "   [NON-DISCRIMINATING: this model outputs the same class for " \
+              "every session — its vote carries no information]" if is_constant else ""
+        lines = [f"  {model_name}: {prediction} ({confidence*100:.1f}%){tag}"]
 
         if xai_result.get('shap_ok') and not xai_result.get('informative', True):
             lines.append("    SHAP/LIME: UNINFORMATIVE for this model — it applies a "
@@ -1338,18 +1407,31 @@ Prediction: [Attack or Normal]"""
             for mn, pred in all_predictions.items():
                 xai_r = xai_results.get(mn, dict(_EMPTY_XAI))
                 evidence += self._format_xai_for_prompt(
-                    mn, xai_r, pred['prediction'], pred['confidence'])
+                    mn, xai_r, pred['prediction'], pred['confidence'],
+                    is_constant=(mn in self.constant_models))
                 evidence += "\n\n"
         else:
             # XAI ABLATION: predictions + confidence only, no SHAP/LIME.
             evidence += "ML CLASSIFIER PREDICTIONS\n"
             evidence += "=" * 60 + "\n"
             for mn, pred in all_predictions.items():
+                tag = ("   [NON-DISCRIMINATING: same class every session]"
+                       if mn in self.constant_models else "")
                 evidence += (f"  {mn}: {pred['prediction']} "
-                             f"({pred['confidence']*100:.1f}%)\n")
+                             f"({pred['confidence']*100:.1f}%){tag}\n")
             evidence += "\n"
 
-        evidence += f"Vote tally: {votes.get('Malicious',0)} Attack, {votes.get('Normal',0)} Normal\n"
+        disc = {m: p for m, p in all_predictions.items()
+                if m not in self.constant_models}
+        dv   = Counter([p['prediction'] for p in disc.values()])
+        evidence += (f"Raw vote tally (all {len(all_predictions)} models): "
+                     f"{votes.get('Malicious',0)} Attack, {votes.get('Normal',0)} Normal\n")
+        if self.constant_models:
+            evidence += (f"DISCRIMINATING vote tally (excluding the "
+                         f"{len(self.constant_models)} non-discriminating models): "
+                         f"{dv.get('Malicious',0)} Attack, {dv.get('Normal',0)} Normal\n")
+            evidence += ("Use the DISCRIMINATING tally. The raw tally is skewed by "
+                         "models that never change their answer.\n")
         if self.use_xai:
             evidence += ("Note: use the SHAP/LIME explanations to assess each model's "
                          "credibility, not just its vote.\n")
@@ -1386,25 +1468,19 @@ Provide your structured analysis using the format in your instructions."""
         if type_match:
             attack_type = type_match.group(1)
 
-        reasoning_summary = ""
-        m = re.search(
-            r'reasoning_summary:\s*\n(.*?)(?=\nconflicting_signals:|\nconfidence:|\nprediction:|\Z)',
-            stage2_response, re.DOTALL | re.IGNORECASE)
-        if m:
-            reasoning_summary = m.group(1).strip()
+        reasoning_summary = extract_section(
+            "REASONING_SUMMARY", stage2_response,
+            ["CONFLICTING_SIGNALS", "CONFIDENCE", "PREDICTION"])
 
-        conflicts_text = ""
-        m2 = re.search(
-            r'conflicting_signals:\s*\n(.*?)(?=\nconfidence:|\nattack_type:|\nprediction:|\Z)',
-            stage2_response, re.DOTALL | re.IGNORECASE)
-        if m2:
-            conflicts_text = m2.group(1).strip()
+        conflicts_text = extract_section(
+            "CONFLICTING_SIGNALS", stage2_response,
+            ["CONFIDENCE", "ATTACK_TYPE", "PREDICTION"])
 
-        xai_assessment = _section("SHAP_LIME_ASSESSMENT", stage1_response,
-                                  ["DOMAIN_MATCH", "HISTORICAL"])
+        xai_assessment = extract_section("SHAP_LIME_ASSESSMENT", stage1_response,
+                                         ["DOMAIN_MATCH", "HISTORICAL"])
 
-        physical_interp = _section("PHYSICAL_INTERPRETATION", stage1_response,
-                                   ["SHAP_LIME", "DOMAIN_MATCH"])
+        physical_interp = extract_section("PHYSICAL_INTERPRETATION", stage1_response,
+                                          ["SHAP_LIME", "DOMAIN_MATCH"])
 
         # Always-classify fallback: tone inference, then ML majority (no ABSTAIN)
         ml_majority = votes.most_common(1)[0][0] if votes else 'Normal'
