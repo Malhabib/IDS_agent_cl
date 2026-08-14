@@ -263,8 +263,13 @@ def extract_section(name: str, text: str, stops: List[str]) -> str:
     """
     if not text:
         return ""
-    stop = "|".join(rf"\n\s*\**\s*#*\s*{t}" for t in stops) or r"\Z"
-    pat = rf"\**\s*#*\s*{name}\s*\**\s*:\s*\**\s*(.*?)(?={stop}|\Z)"
+    # The colon is OPTIONAL: models frequently emit the header as a markdown
+    # heading ("### SHAP_LIME_ASSESSMENT") or bold label ("**SHAP_LIME_ASSESSMENT**")
+    # with no colon at all. Requiring one is what kept the XAI-reference count
+    # pinned at 0/50 even after same-line and bold formats were handled.
+    num  = r"(?:\d+[\.\)]\s*)?"          # optional "2." / "3)" numbering
+    stop = "|".join(rf"\n\s*\**\s*#*\s*{num}{t}" for t in stops) or r"\Z"
+    pat  = rf"\**\s*#*\s*{num}{name}\s*\**\s*:?\s*\**\s*(.*?)(?={stop}|\Z)"
     m = re.search(pat, text, re.DOTALL | re.IGNORECASE)
     return m.group(1).strip() if m else ""
 
