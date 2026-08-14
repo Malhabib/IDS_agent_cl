@@ -276,11 +276,38 @@ def aggregate_runs(result_files: List[str]) -> str:
     return "\n".join(out)
 
 
+def _expand(args: List[str]) -> List[str]:
+    """
+    Expand wildcards internally.
+
+    Windows cmd.exe does not expand globs before launching a program, so
+    "...\\*.json" arrives here as a literal string and open() fails. Expanding
+    here makes the same command work on Windows, PowerShell and POSIX shells.
+    """
+    import glob as _glob
+    out: List[str] = []
+    for a in args:
+        if any(ch in a for ch in "*?["):
+            hits = sorted(_glob.glob(a))
+            if not hits:
+                print(f"  [WARN] no files matched: {a}")
+            out.extend(hits)
+        else:
+            out.append(a)
+    return out
+
+
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) < 2:
+    args = _expand(sys.argv[1:])
+    if not args:
         print(__doc__)
-        print("\nAggregate several runs:")
-        print("  python llm_eval_metrics_v29_1.py <result1.json> <result2.json> ...")
+        print("Aggregate several runs (wildcards are expanded internally):")
+        print("  python llm_eval_metrics_v29_1.py results/triple_llm_v6_v29_1_*.json")
+        print("  python llm_eval_metrics_v29_1.py runA.json runB.json runC.json")
     else:
-        print(aggregate_runs(sys.argv[1:]))
+        print(f"  Aggregating {len(args)} file(s):")
+        for a in args:
+            print(f"    {a}")
+        print()
+        print(aggregate_runs(args))
