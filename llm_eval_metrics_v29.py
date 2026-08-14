@@ -223,3 +223,64 @@ def ratio_oracle_predictions(results: List[Dict], threshold: float = 1.3) -> Lis
     """
     return ['Malicious' if r['result'].get('delivery_ratio', 0) > threshold
             else 'Normal' for r in results]
+
+
+# ── MULTI-BATCH AGGREGATION ──────────────────────────────────────────────────
+def aggregate_runs(result_files: List[str]) -> str:
+    """
+    Combine several result JSONs (different sampling seeds) into a mean +/- std
+    table.
+
+    A single 50-session batch is a weak basis for a headline number: a perfect
+    score on one draw invites the reviewer question "would it hold on another?".
+    Reporting the mean and standard deviation across independent batches, with a
+    pooled confidence interval, answers that directly and is what reviewers
+    expect. It also removes the awkwardness of publishing an unqualified 1.00.
+
+    Usage:
+        python llm_eval_metrics_v29.py results/run_seed42.json results/run_seed7.json ...
+    """
+    import json, statistics
+    per_llm = {'llama': [], 'qwen': [], 'glm': []}
+    pooled  = {'llama': [0, 0], 'qwen': [0, 0], 'glm': [0, 0]}   # [correct, n]
+    seeds   = []
+    for path in result_files:
+        with open(path) as f:
+            blob = json.load(f)
+        seeds.append(blob.get('sample_seed', '?'))
+        for k in per_llm:
+            rows = blob.get(f'results_{k}') or []
+            if not rows:
+                continue
+            corr = sum(1 for r in rows if r.get('correct'))
+            per_llm[k].append(corr / len(rows))
+            pooled[k][0] += corr
+            pooled[k][1] += len(rows)
+
+    out = []
+    out.append(f"  Batches: {len(result_files)}   seeds: {seeds}")
+    out.append(f"  {'LLM':<8} | {'mean':>7} | {'std':>7} | {'min':>7} | "
+               f"{'max':>7} | {'pooled':>7} | {'pooled 95% CI':>18} | {'N':>5}")
+    out.append(f"  {'-'*84}")
+    for k, accs in per_llm.items():
+        if not accs:
+            continue
+        c, n = pooled[k]
+        lo, hi = wilson_ci(c, n)
+        sd = statistics.stdev(accs) if len(accs) > 1 else 0.0
+        out.append(f"  {k:<8} | {statistics.mean(accs):>7.4f} | {sd:>7.4f} | "
+                   f"{min(accs):>7.4f} | {max(accs):>7.4f} | {c/n:>7.4f} | "
+                   f"[{lo:>6.4f}, {hi:>6.4f}] | {n:>5}")
+    out.append("\n  Report the pooled accuracy with its interval, and the")
+    out.append("  across-batch std as the stability measure.")
+    return "\n".join(out)
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print(__doc__)
+        print("\nAggregate several runs:")
+        print("  python llm_eval_metrics_v29.py <result1.json> <result2.json> ...")
+    else:
+        print(aggregate_runs(sys.argv[1:]))

@@ -215,6 +215,16 @@ def select_samples(df, test_indices, cmap, seed=42):
 """)
     design = input("  Design (1/2) [2]: ").strip() or "2"
 
+    # SAMPLING SEED. A single 50-session batch is a fragile basis for a headline
+    # number: one perfect run invites the reviewer question "would it hold on a
+    # different draw?". Running several disjoint batches with different seeds
+    # and reporting mean +/- std answers that directly.
+    try:
+        seed = int(input("  Sampling seed (change it for a fresh batch) [42]: ").strip() or "42")
+    except ValueError:
+        seed = 42
+    print(f"  Sampling seed: {seed}")
+
     if design == "2" and len(hard) > 0:
         n_hard = min(len(hard), max(1, int(round(n * 0.20))))   # ~20% hard
         hs     = hard.sample(n=n_hard, random_state=seed)
@@ -244,7 +254,7 @@ def select_samples(df, test_indices, cmap, seed=42):
             mal_df.sample(n=min(nm, len(mal_df)), random_state=seed),
         ]).sample(frac=1, random_state=seed)
         print(f"  Selected {len(sel)} samples ({nn}N, {nm}M) [balanced]")
-    return sel.index.tolist()
+    return sel.index.tolist(), seed
 
 
 def _classify_one(agent, idx, gt):
@@ -1023,7 +1033,8 @@ RUN MODE
         print(f"\nModel error: {e}")
         return
 
-    selected = select_samples(df, test_indices, cmap)
+    selected, sample_seed = select_samples(df, test_indices, cmap)
+    scenario_tag = f"{scenario_tag}_seed{sample_seed}"
     config = {
         'data_path':           DATA_PATH,
         'models_dir':          models_dir,
@@ -1110,6 +1121,7 @@ RUN MODE
                 'use_knowledge': use_knowledge,
                 'use_memory':    use_memory,
                 'use_xai':       use_xai,
+                'sample_seed':   sample_seed,
                 'shap_used':     SHAP_AVAILABLE,
                 'lime_used':     LIME_AVAILABLE,
                 'timestamp':     ts,

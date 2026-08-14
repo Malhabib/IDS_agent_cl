@@ -1708,16 +1708,26 @@ Provide your structured analysis using the format in your instructions."""
         if extract_verdict(stage2_response) is None:
             n_repair = 1
             self._log(f"  [REPAIR] No verdict found — requesting the final line explicitly")
-            repair = self.llm_client.generate_two_turn(
-                system_prompt   = sys_prompt,
-                first_user      = stage1_prompt,
-                first_assistant = stage1_response + "\n\n" + stage2_response,
-                second_user     = ("Your previous answer did not state the final line. "
-                                   "Reply with ONLY one line, exactly: "
-                                   "'Prediction: Attack' or 'Prediction: Normal'."),
+            # MINIMAL repair. The earlier version replayed the whole ~10k-char
+            # evidence prompt plus both responses, which simply invited a
+            # verbose model to ramble again -- GLM averaged 5,637 words per
+            # session and still failed to emit a verdict in 18 of 50 sessions.
+            # This call carries only the analyst's own conclusion and the raw
+            # physical facts, and demands a single word.
+            tail = (stage2_response or stage1_response or "")[-900:]
+            repair = self.llm_client.generate_with_system(
+                system_prompt=("You output exactly one word and nothing else. "
+                               "No reasoning, no punctuation, no explanation."),
+                user_prompt=(
+                    f"An analyst reviewed an EV charging session and wrote:\n\n"
+                    f"{tail}\n\n"
+                    f"Measured facts: requested {requested_kwh:.3f} kWh, "
+                    f"delivered {delivered_kwh:.3f} kWh "
+                    f"(delivered/requested = {delivery_ratio:.3f}).\n\n"
+                    f"Answer with ONE word only — Attack or Normal:"),
                 temperature=0.0, max_tokens=self._repair_budget())
             if repair and not repair.startswith("Error:"):
-                stage2_response = stage2_response + "\n" + repair.strip()
+                stage2_response = stage2_response + "\nPrediction: " + repair.strip()
                 self._log(f"  [REPAIR] Recovered: {repair.strip()[:60]}")
 
         # Self-consistency (V26 enhancement, pipeline unchanged): for AMBIGUOUS
