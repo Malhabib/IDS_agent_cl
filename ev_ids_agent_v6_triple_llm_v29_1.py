@@ -1452,7 +1452,7 @@ Provide your structured analysis using the format in your instructions."""
                             all_predictions, delivery_ratio, duration_hours,
                             line_number, votes, ltm_cases,
                             rag_sources, complexity_metrics, difficulty_zone,
-                            xai_top_feature=""):
+                            xai_top_feature="", repair_used=False):
         predicted_label = None
         llm_confidence  = "medium"
         attack_type     = "none"
@@ -1493,20 +1493,29 @@ Provide your structured analysis using the format in your instructions."""
         # V23 would have scored ONLY these (everything else was ABSTAIN), so the
         # runner can report a V23-comparable metric alongside always-classify.
         llm_parsed = predicted_label is not None
+
+        # The tone heuristic that used to sit here has been REMOVED. It decided
+        # by counting the literal words "attack" and "normal" in the response.
+        # Every SHAP line in the prompt reads "(toward Attack)" or "(toward
+        # Normal)", so a verbose model that quotes and discusses those lines
+        # accumulates the token "attack" regardless of its actual conclusion.
+        # On the last Scenario A run GLM produced 5,247 words per session and
+        # 21 of its 50 decisions were taken by this word count -- with 14 more
+        # falling back to the ML majority, 70% of its reported decisions never
+        # came from a stated verdict. That is not a measurement of the model.
+        # A verdict is now either stated, recovered by the one-word repair
+        # request, or deferred to the ML majority, and which of the three is
+        # recorded in verdict_source.
         if predicted_label is None:
-            atk = resp_lower.count('attack') + resp_lower.count('malicious') + resp_lower.count('fraud')
-            nrm = resp_lower.count('normal') + resp_lower.count('legitimate')
-            if atk > nrm + 2:
-                predicted_label = 'Malicious'
-                self._log(f"    [WARN] Prediction inferred from tone: Malicious")
-            elif nrm > atk + 2:
-                predicted_label = 'Normal'
-                self._log(f"    [WARN] Prediction inferred from tone: Normal")
-            else:
-                predicted_label = ml_majority
-                llm_confidence  = "low"
-                used_fallback   = True
-                self._log(f"    [WARN] LLM unparseable — fallback to ML majority: {ml_majority}")
+            predicted_label = ml_majority
+            llm_confidence  = "low"
+            used_fallback   = True
+            self._log(f"    [WARN] No verdict stated or recovered — "
+                      f"deferring to ML majority: {ml_majority}")
+
+        verdict_source = ('ml_fallback' if used_fallback
+                          else 'repaired' if repair_used
+                          else 'stated')
 
         if predicted_label == 'Malicious' and attack_type == 'none':
             attack_type = ('energy_theft'    if delivery_ratio > 1.3 else
@@ -1533,6 +1542,7 @@ Provide your structured analysis using the format in your instructions."""
             "llm_overrode_ml":      llm_overrode_ml,
             "used_fallback":        used_fallback,
             "llm_parsed":           llm_parsed,
+            "verdict_source":       verdict_source,
             "xai_top_feature":      xai_top_feature,
             "difficulty_zone":      difficulty_zone,
             "llm_reasoning":        reasoning_summary[:500] if reasoning_summary else stage2_response[:500],
@@ -1705,6 +1715,7 @@ Provide your structured analysis using the format in your instructions."""
         # Verdict repair (V26): only when no verdict can be extracted at all.
         # Recovers sessions V23 would have thrown away as ABSTAIN.
         n_repair = 0
+        repair_used = False
         if extract_verdict(stage2_response) is None:
             n_repair = 1
             self._log(f"  [REPAIR] No verdict found — requesting the final line explicitly")
@@ -1728,6 +1739,7 @@ Provide your structured analysis using the format in your instructions."""
                 temperature=0.0, max_tokens=self._repair_budget())
             if repair and not repair.startswith("Error:"):
                 stage2_response = stage2_response + "\nPrediction: " + repair.strip()
+                repair_used = extract_verdict(stage2_response) is not None
                 self._log(f"  [REPAIR] Recovered: {repair.strip()[:60]}")
 
         # Self-consistency (V26 enhancement, pipeline unchanged): for AMBIGUOUS
@@ -1790,7 +1802,7 @@ Provide your structured analysis using the format in your instructions."""
             stage2_response, stage1_response, all_predictions,
             delivery_ratio, duration_hours, line_number, votes,
             ltm_cases, knowledge_sources, complexity, difficulty_zone,
-            xai_top_feature)
+            xai_top_feature, repair_used=repair_used)
 
         session_time = time.time() - t0
         final_result['complexity']['session_total_sec'] = round(session_time, 2)

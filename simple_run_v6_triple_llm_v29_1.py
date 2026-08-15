@@ -454,10 +454,17 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
     glm_m   = {'IDS_Agent': calculate_metrics(ground_truths, glm_preds['IDS_Agent'])}
 
     # FALLBACK COUNTS (LLM output unparseable -> ML majority used)
-    print(f"\nFALLBACK COUNTS (unparseable LLM output -> ML majority):")
+    # DECISION PROVENANCE. Reporting only a fallback count hid the fact that a
+    # large share of decisions were previously taken by a word-frequency
+    # heuristic rather than a stated verdict. Every decision is now attributable.
+    print(f"\nDECISION PROVENANCE (where each verdict actually came from):")
+    print(f"  {'LLM':<8} | {'stated':>7} | {'repaired':>9} | {'ML fallback':>12} | {'n':>4}")
+    print(f"  {'-'*50}")
     for name, results in [('Llama', results_llama), ('Qwen', results_qwen), ('GLM', results_glm)]:
-        n_fb = sum(1 for r in results if r['result'].get('used_fallback'))
-        print(f"  {name}: {n_fb}/{len(results)}")
+        src = [r['result'].get('verdict_source', 'stated') for r in results]
+        print(f"  {name:<8} | {src.count('stated'):>7} | {src.count('repaired'):>9} | "
+              f"{src.count('ml_fallback'):>12} | {len(results):>4}")
+    print(f"  Only 'stated' and 'repaired' reflect the model's own judgement.")
 
     # V23-COMPARABLE METRIC ----------------------------------------------------
     # V23 reported accuracy EXCLUDING abstained sessions, so its headline
