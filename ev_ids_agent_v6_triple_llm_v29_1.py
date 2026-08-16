@@ -175,7 +175,10 @@ MODEL_GEN_POLICY = {
     # (~1,500 words/stage): it was being truncated BEFORE emitting the verdict
     # line, which is why format compliance sat at 0.26 with 28/50 fallbacks.
     # It needs room to think AND answer.
-    'glm':  {'num_predict': 4096, 'repeat_penalty': 1.20, 'thinking': True},
+    # GLM consumed all 4096 tokens on the reasoning channel and returned an
+    # empty answer, measured at ~5,000 words of reasoning per session. It needs
+    # headroom to finish reasoning and still write the verdict.
+    'glm':  {'num_predict': 8192, 'repeat_penalty': 1.20, 'thinking': True},
     'llama': {'num_predict': 2048, 'repeat_penalty': 1.15, 'thinking': False},
 }
 
@@ -345,7 +348,7 @@ class OllamaClient:
         except ImportError:
             raise ImportError("Ollama library not installed. Run: pip install ollama")
 
-    def _call(self, messages, temperature, max_tokens):
+    def _call(self, messages, temperature, max_tokens, force_no_think=False):
         # Per-model generation policy: a runaway-loop guard that is invisible to
         # models generating normal-length answers.
         options = {'num_ctx': NUM_CTX,
@@ -358,7 +361,12 @@ class OllamaClient:
             options['num_predict'] = max_tokens
         kwargs = dict(model=self.model_name, messages=messages,
                       options=options, keep_alive=KEEP_ALIVE)
-        if self.thinking_capable:
+        # force_no_think: for a trivial read-out ("Attack or Normal?") the
+        # reasoning channel is pure cost. A thinking model given think=True
+        # spends its whole num_predict budget reasoning and returns an EMPTY
+        # content field, which is exactly why GLM's verdict repair kept
+        # failing and 46% of its decisions ended up decided by word counting.
+        if self.thinking_capable and not force_no_think:
             try:
                 return self.chat(think=True, **kwargs)
             except Exception:
@@ -374,16 +382,20 @@ class OllamaClient:
         # genuinely empty — otherwise a tentative mid-reasoning statement can
         # be mistaken for the final verdict.
         if not content and thinking:
+            print(f"    [{tag}] answer channel EMPTY — the budget was consumed by "
+                  f"reasoning; falling back to the reasoning text")
             content = thinking.strip()
         return content
 
     def generate_with_system(self, system_prompt, user_prompt,
                              temperature=LLM_TEMPERATURE,
-                             max_tokens=STAGE1_MAX_TOKENS, **kwargs):
+                             max_tokens=STAGE1_MAX_TOKENS,
+                             force_no_think=False, **kwargs):
         try:
             messages = [{'role': 'system', 'content': system_prompt},
                         {'role': 'user',   'content': user_prompt}]
-            return self._extract(self._call(messages, temperature, max_tokens))
+            return self._extract(self._call(messages, temperature, max_tokens,
+                                            force_no_think=force_no_think))
         except Exception as e:
             return f"Error: {str(e)}"
 
@@ -424,7 +436,7 @@ class VLLMClient:
         print(f"  [OK] vLLM client ready for {model_name} at {self.base_url} "
               f"(PagedAttention + continuous batching server-side)")
 
-    def _call(self, messages, temperature, max_tokens):
+    def _call(self, messages, temperature, max_tokens, force_no_think=False):
         temp = temperature if temperature is not None else self.temperature
         body = {'model': self.model_name, 'messages': messages,
                 'max_tokens': max_tokens or self.policy['num_predict']}
@@ -1210,9 +1222,9 @@ class EVIDSAgentV6TripleLLMV29_1:
         writes any content, so a 24-token repair budget guarantees an empty
         answer. Thinking models therefore need room to think AND answer.
         """
-        if getattr(self.llm_client, 'thinking_capable', False):
-            return 2048          # thinking burns the budget before answering
-        return REPAIR_MAX_TOKENS
+        # The read-out runs with force_no_think, so the reasoning channel is not
+        # in play and a small budget suffices for every model.
+        return 64
 
     def _log(self, msg):
         """Buffer one console line for this session.
@@ -1736,7 +1748,8 @@ Provide your structured analysis using the format in your instructions."""
                     f"delivered {delivered_kwh:.3f} kWh "
                     f"(delivered/requested = {delivery_ratio:.3f}).\n\n"
                     f"Answer with ONE word only — Attack or Normal:"),
-                temperature=0.0, max_tokens=self._repair_budget())
+                temperature=0.0, max_tokens=self._repair_budget(),
+                force_no_think=True)
             if repair and not repair.startswith("Error:"):
                 stage2_response = stage2_response + "\nPrediction: " + repair.strip()
                 repair_used = extract_verdict(stage2_response) is not None
