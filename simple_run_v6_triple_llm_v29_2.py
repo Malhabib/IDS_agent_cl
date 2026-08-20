@@ -79,6 +79,76 @@ def check_available_models(ollama_url="http://localhost:11434"):
         return []
 
 
+def check_gpu_residency(model_name, base_url="http://localhost:11434"):
+    """Load one model and report how much of it Ollama placed in VRAM.
+
+    A model that does not fit in VRAM is not merely slow: on the target
+    machine glm-4.7-flash (19 GB on an 8 GB card) ran at 67%/33% CPU/GPU and
+    0.08 words/sec, so calls timed out, timed-out calls fell back to the ML
+    verdict, and two runs of identical code on identical data at temperature
+    0 produced different accuracies. Partial residency therefore invalidates
+    the experiment rather than lengthening it, which is why this runs before
+    any sample is classified.
+
+    Returns the fraction of the model resident in VRAM (1.0 = fully on GPU),
+    or None if Ollama could not be queried.
+    """
+    import requests
+    try:
+        # A one-token generate is the cheapest way to force the load.
+        requests.post(f"{base_url}/api/generate",
+                      json={'model': model_name, 'prompt': 'hi',
+                            'stream': False, 'options': {'num_predict': 1}},
+                      timeout=600).raise_for_status()
+        ps = requests.get(f"{base_url}/api/ps", timeout=10).json()
+    except Exception as e:
+        print(f"  [{model_name}] residency check failed: {e}")
+        return None
+
+    for m in ps.get('models', []):
+        if m.get('model') != model_name and m.get('name') != model_name:
+            continue
+        total = float(m.get('size', 0) or 0)
+        vram  = float(m.get('size_vram', 0) or 0)
+        if total <= 0:
+            return None
+        frac = vram / total
+        gb   = lambda b: b / (1024 ** 3)
+        ctx  = m.get('context_length') or m.get('details', {}).get('context_length')
+        note = "100% GPU" if frac >= 0.999 else f"{(1-frac)*100:.0f}%/{frac*100:.0f}% CPU/GPU"
+        print(f"  {model_name:<24} {gb(total):5.1f} GB  {note:<18}"
+              + (f"  ctx={ctx}" if ctx else ""))
+        return frac
+    print(f"  {model_name:<24} not reported by /api/ps")
+    return None
+
+
+def preflight_gpu_residency(model_ids, base_url="http://localhost:11434"):
+    """Check every model the run will use, unloading each one afterwards.
+
+    Prints a table and returns the list of slots that are not fully resident.
+    """
+    print("\nGPU RESIDENCY PREFLIGHT")
+    print("  Each model is loaded once and released. A model that reports")
+    print("  anything other than 100% GPU will produce unreproducible results.")
+    degraded = []
+    for slot, name in model_ids.items():
+        frac = check_gpu_residency(name, base_url)
+        if frac is None or frac < 0.999:
+            degraded.append((slot, name, frac))
+        unload_ollama_model(name, base_url)
+    if degraded:
+        print("\n  NOT FULLY ON GPU:")
+        for slot, name, frac in degraded:
+            where = "unknown" if frac is None else f"{frac*100:.0f}% GPU"
+            print(f"    {slot:<6} {name:<24} {where}")
+        print("  Free VRAM (close browsers, Teams, Copilot and other desktop")
+        print("  applications) or choose a smaller variant before running.")
+    else:
+        print("\n  All models fully resident in VRAM.")
+    return degraded
+
+
 def test_llm_connectivity(client):
     print(f"\nTesting {client.model_name}...")
     try:
@@ -890,8 +960,19 @@ XAI (SHAP + LIME) — ABLATION SWITCH
     base_url = input(f"Server URL [{default_url}]: ").strip() or default_url
 
     # Model names per LLM slot (vLLM serves HuggingFace ids, not Ollama tags)
+    # Model choice is constrained by VRAM. Measured on the target machine
+    # (Quadro M4000, 8 GB, with roughly 7.7 GB held by desktop applications):
+    #   glm-4.7-flash  19.0 GB  -> 2.4x the whole card; Ollama reported
+    #                             67%/33% CPU/GPU, 0.08 words/sec and eleven
+    #                             hours per session, and requests timed out
+    #   glm4            5.5 GB  -> same family, fits alongside a 4 KV cache
+    #   llama3          4.7 GB  -> fits
+    #   qwen3.5         6.6 GB  -> fits only with desktop applications closed
+    # A model that does not fit is not slow, it is unmeasurable: timed-out
+    # calls become ML fallbacks and identical inputs stop giving identical
+    # outputs.
     model_ids = {'llama': 'llama3:latest',
-                 'glm':   'glm-4.7-flash:latest',
+                 'glm':   'glm4:latest',
                  'qwen':  'qwen3.5:latest'}   # used by the run and the sweep
 
     if backend == 'vllm':
@@ -1032,6 +1113,11 @@ RUN MODE
         except Exception as e:
             print(f"\nOllama error: {e}")
             return
+        degraded = preflight_gpu_residency(model_ids, base_url)
+        if degraded:
+            if input("\n  Run anyway? (y/N): ").strip().lower() != 'y':
+                print("  Aborted. Free VRAM and re-run.")
+                return
 
     models_dir = os.path.join(WORKSPACE_DIR, "models")
     try:
@@ -1071,7 +1157,7 @@ RUN MODE
             self_consistency_k=sc_k, use_xai=use_xai)
 
     # RUN LLAMA
-    print(f"\nMANUAL: make sure llama3:latest is available on the backend")
+    print(f"\nMANUAL: make sure {model_ids['llama']} is available on the backend")
     agent_llama = make_agent(model_ids["llama"])
     if use_memory and agent_llama.ltm:
         agent_llama.ltm.clear()
@@ -1083,19 +1169,20 @@ RUN MODE
     # RUN GLM — free the previous model's VRAM first so GLM gets the whole GPU
     if backend == 'ollama':
         unload_ollama_model(model_ids["llama"], base_url)
-    print(f"\nMANUAL: switch to glm-4.7-flash:latest")
+    print(f"\nMANUAL: switch to {model_ids['glm']}")
     agent_glm = make_agent(model_ids["glm"])
     if use_memory and agent_glm.ltm:
         agent_glm.ltm.clear()
         agent_glm.seed_ltm_from_training(train_indices, n_seed=50)
-    results_glm = run_classification(agent_glm, "[GLM]", "GLM-4.7-FLASH",
+    results_glm = run_classification(agent_glm, "[GLM]",
+                                      model_ids['glm'].split(':')[0].upper(),
                                       selected, df, workers=workers)
     shared_store.save()
 
     # RUN QWEN — free the previous model's VRAM first
     if backend == 'ollama':
         unload_ollama_model(model_ids["glm"], base_url)
-    print(f"\nMANUAL: switch to qwen3.5:latest")
+    print(f"\nMANUAL: switch to {model_ids['qwen']}")
     agent_qwen = make_agent(model_ids["qwen"])
     if use_memory and agent_qwen.ltm:
         agent_qwen.ltm.clear()
@@ -1133,7 +1220,7 @@ RUN MODE
                 'lime_used':     LIME_AVAILABLE,
                 'timestamp':     ts,
                 'description':   f'Scenario {choice}: {sc["desc"]}',
-                'llms':          {'llama': 'llama3', 'qwen': 'qwen3.5', 'glm': 'glm-4.7-flash'},
+                'llms':          {k: v for k, v in model_ids.items()},
                 'results_llama': results_llama,
                 'results_qwen':  results_qwen,
                 'results_glm':   results_glm

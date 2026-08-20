@@ -29,13 +29,20 @@ Reading the result
 
 Usage
 -----
-    python glm_diagnostic.py                       # default glm-4.7-flash
+    python glm_diagnostic.py                       # default glm4
     python glm_diagnostic.py qwen3.5:latest        # sanity-check a good model
+
+Run this only once `ollama ps` reports 100% GPU for the model under test. A
+model that is partly on the CPU times out rather than answers, and every
+timeout is scored here as a wrong answer, so a partly-resident model looks
+exactly like an incapable one.
 """
 
 import sys, time
 
-MODEL = sys.argv[1] if len(sys.argv) > 1 else "glm-4.7-flash:latest"
+# glm4 (5.5 GB), not glm-4.7-flash (19 GB): the larger variant does not fit in
+# 8 GB of VRAM and its answers were timeouts, not judgements.
+MODEL = sys.argv[1] if len(sys.argv) > 1 else "glm4:latest"
 
 # 12 sessions: 6 clearly normal (ratio ~1.00), 6 clear attacks (ratio >= 1.5).
 # Deliberately unambiguous -- a competent analyst should score 12/12.
