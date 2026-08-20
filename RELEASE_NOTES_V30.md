@@ -9,8 +9,8 @@ happened.
 
 ## 1. The GLM problem, and what it actually was
 
-GLM was never failing at the task. Two mechanical faults made it impossible for
-GLM to answer, and a third made the resulting damage invisible.
+GLM was never failing at the task. Mechanical faults made it impossible for GLM
+to answer, and made the resulting damage invisible.
 
 ### 1.1 Stage 2 ran on a 128-token budget with the reasoning channel on
 
@@ -43,14 +43,7 @@ the reasoning belongs and Stage 2 is a commitment step; and disabling the
 reasoning channel outright below `THINK_MIN_BUDGET` (512) rather than letting it
 consume a budget too small to finish in.
 
-### 1.2 A timed-out call was scored as a model decision
-
-The Ollama call had **no timeout at all**. A failure returned the string
-`"Error: ..."`, no verdict could be parsed from it, and the session silently
-became an ML-majority fallback — which was then counted as the model's own
-answer.
-
-This is the whole explanation for the irreproducibility:
+### 1.2 The granted context varies between runs — and that is the irreproducibility
 
 | run | GLM | Llama |
 |---|---|---|
@@ -58,26 +51,60 @@ This is the whole explanation for the irreproducibility:
 | 20 Aug | 0.66, 14 stated | 0.96 |
 
 Same code, same seed, same data, temperature 0. Greedy decoding cannot do that.
-The runs differed only in how many calls happened to time out.
+
+The V30 healthcheck, run with the desktop applications closed, reports
+`granted context 8192` for `llama3` and `glm4`. Earlier `ollama ps` output on
+the same machine reported `CONTEXT 4096` for the same `llama3`. **The window
+Ollama grants depends on the VRAM free at load time, so it varies from run to
+run** — and per §1.1 that single number swings GLM's Stage 2 budget between
+1536 and 128. That is a sufficient mechanism for the observed instability, and
+it is now directly evidenced rather than inferred.
+
+An earlier draft of these notes attributed the instability to timeouts. That was
+wrong: the V29.2 calls carried no deadline, so they did not time out — they
+simply took as long as they took, which is where the two-day runtime came from.
+Timeouts are a real hazard that V30 now bounds, but they were not the mechanism
+behind the differing accuracies.
+
+### 1.3 A failed call was scored as a model decision
+
+The Ollama call had **no timeout at all**, and a failure returned the string
+`"Error: ..."`. No verdict could be parsed from it, so the session silently
+became an ML-majority fallback — counted as the model's own answer.
 
 **Fixed by:** every call now carries a deadline (`LLM_CALL_TIMEOUT_SEC`, 300 s).
 A missed deadline is recorded as a distinct `verdict_source = 'llm_error'`,
 excluded from the behavioural metrics, and reported under its own column with a
 **NOT PUBLISHABLE** banner when present.
 
-### 1.3 A timeout was being disguised as a capability problem
+### 1.4 A timeout was being disguised as a capability problem
 
 `_call` caught *every* exception around `think=True` and retried without
 thinking. So a timeout was silently reclassified as "this model can't do
 thinking" and never surfaced. Only a genuine unsupported-feature error now
 disables the channel; a transport fault propagates and is recorded.
 
-### 1.4 Model selection
+### 1.5 Model selection
 
-`glm-4.7-flash` is 19 GB against an 8 GB Quadro M4000 — 2.4× the entire card,
-before the ~7.7 GB held by desktop applications. Ollama's `67%/33% CPU/GPU` at
-0.08 words/sec was the best it could do. The default is now `glm4:latest`
-(5.5 GB, same family, already pulled).
+Measured on the target machine (Quadro M4000, 8 GB):
+
+| model | size | residency | verdict |
+|---|---|---|---|
+| `llama3:latest` | 5.2 GB | 100% GPU, ctx 8192 | usable |
+| `glm4:latest` | 5.3 GB | 100% GPU, ctx 8192 | usable |
+| `glm-4.7-flash:latest` | 19 GB | 67%/33% CPU/GPU | 2.4x the card — never fits |
+| `qwen3.5:latest` | 10.3 GB | **2% GPU** | larger than the card — never fits |
+
+`qwen3.5` is the important one. At 10.3 GB it exceeds the entire 8 GB card, so
+no amount of closing applications will make it fit. Every previous Qwen result,
+including the 1.0000, was produced by a model running almost entirely on the
+CPU. That does not make the outputs wrong — CPU inference is still inference —
+but it is the direct source of the multi-day runtime, and it means Qwen was
+never measured under the same conditions as the other two models.
+
+The GLM default is now `glm4:latest`. A Qwen variant that fits in 8 GB must be
+chosen before the study runs; `healthcheck_v30.py` lists the installed models by
+size and marks which ones fit.
 
 ---
 
@@ -103,8 +130,25 @@ three within minutes of starting:
 | V26 | the section parser required a colon → "XAI referenced 0/50" | selftest (section formats) |
 | V29 | a helper renamed at call sites but not at its definition | selftest (symbol existence) |
 | V29.1 | GLM's Stage 2 on a 128-token floor with thinking on | selftest + healthcheck |
-| V29.2 | timeouts silently scored as ML fallbacks | integration test + healthcheck |
-| all | model not resident in VRAM → 11 h/session | healthcheck (projected hours) |
+| V29.2 | failed calls silently scored as ML fallbacks | integration test + healthcheck |
+| all | granted context varying with free VRAM | healthcheck (granted ctx column) |
+| all | model not resident in VRAM → hours per session | healthcheck (projected hours) |
+
+### A note on the healthcheck's own first version
+
+The first version of `healthcheck_v30.py` used one fixed evidence block for all
+six probes. A normal session at ratio 1.004 was therefore shown SHAP values
+pointing toward Attack, and an attack at 1.780 was shown a vote tally of
+"0 Attack, 4 Normal". Its accuracy column measured whether a model could resolve
+deliberately contradictory evidence — not whether it could do the task — and it
+made Llama look worse (4/6) and GLM look constant-Normal (3/6) for reasons that
+were the probe's fault. Its prompt was also 1,445 characters against the study's
+~10,900, so it did not exercise the Stage 2 squeeze it exists to detect.
+
+Both are fixed: the evidence block now tracks the session as SHAP does on real
+data, the prompts are the framework's own system prompt and Stage 2 question,
+and `selftest_v30.py` asserts the consistency so it cannot regress. Any
+correctness figure from a healthcheck run before this fix should be discarded.
 
 ### The in-run circuit breaker
 

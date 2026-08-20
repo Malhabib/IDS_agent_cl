@@ -242,8 +242,15 @@ DEFAULT_GEN_POLICY = {
     'thinking':       False,
 }
 MODEL_GEN_POLICY = {
-    # substring matched against the model name (lowercased)
+    # Substring matched against the model name (lowercased), FIRST MATCH WINS,
+    # so more specific keys must come before more general ones.
     'qwen': {'num_predict': 3072, 'repeat_penalty': 1.10, 'thinking': True},
+    # glm4 is not a reasoning model and rejects think=True. Measured: the client
+    # asked for the reasoning channel, the server refused, and the call was
+    # retried without it -- correct behaviour, but a wasted round trip on every
+    # single call. Declaring it here removes the round trip. Must precede the
+    # generic 'glm' key.
+    'glm4': {'num_predict': 2048, 'repeat_penalty': 1.15, 'thinking': False},
     # GLM measured at ~2,753 words/session against a 2,048-token cap
     # (~1,500 words/stage): it was being truncated BEFORE emitting the verdict
     # line, which is why format compliance sat at 0.26 with 28/50 fallbacks.

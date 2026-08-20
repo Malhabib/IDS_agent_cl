@@ -219,7 +219,42 @@ def main():
         check(f"OllamaClient.{attr} exists",
               hasattr(A.OllamaClient, attr), True)
 
-    # 8 ── the runner imports what it says it imports
+    # 8 ── the healthcheck probes must be internally consistent. The first
+    #      version used ONE fixed evidence block for all six probes, so a normal
+    #      session at ratio 1.004 was shown SHAP values pointing toward Attack
+    #      and an attack at 1.780 was shown a vote tally of 0 Attack. That
+    #      measured contradiction-resolution, not the task, and it produced a
+    #      misleading accuracy column for Llama and GLM.
+    try:
+        import healthcheck_v30 as H
+
+        def tally(ratio):
+            line = [l for l in H.evidence_for(ratio).split('\n')
+                    if 'vote tally' in l][0]
+            return int(line.split(':')[1].split('Attack')[0].strip())
+
+        def dlv_shap(ratio):
+            line = [l for l in H.evidence_for(ratio).split('\n')
+                    if l.strip().startswith('Random Forest')][1]
+            return float(line.split('kWhDelivered')[1].split()[0])
+
+        check("normal probe shows no Attack votes", tally(1.004), 0)
+        check("attack probe shows Attack votes", tally(1.780) >= 2, True)
+        check("both 1.5 probes agree", tally(1.5) == tally(22.80 / 15.20), True)
+        check("SHAP points toward Attack on an attack", dlv_shap(1.78) > 0.1, True)
+        check("SHAP is near zero on a normal", abs(dlv_shap(1.004)) < 0.01, True)
+        # The prompt must be big enough to reproduce the Stage 2 squeeze.
+        p = H.probe_prompt(12.0, 18.0)
+        check("probe prompt is realistically sized",
+              len(H.SYSTEM) + len(p) > 7000, True)
+        check("healthcheck uses the framework's own system prompt",
+              H.SYSTEM == A.EVIDSAgentV6TripleLLMV30._get_system_prompt(None), True)
+        check("healthcheck uses the framework's own Stage 2 question",
+              H.STAGE2_QUESTION == A.EVIDSAgentV6TripleLLMV30.STAGE2_USER, True)
+    except Exception as e:
+        FAIL.append(f"healthcheck import/probe failed: {e}")
+
+    # 9 ── the runner imports what it says it imports
     try:
         import simple_run_v6_triple_llm_v30 as R
         for fn in ('preflight_gpu_residency', 'check_gpu_residency',
