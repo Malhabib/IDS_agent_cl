@@ -112,10 +112,6 @@ The advisor in `healthcheck_v30.py` now distinguishes weights from loaded
 footprint and states which models fit at 8192, which fit only at 4096, and which
 cannot fit at all.
 
-The GLM default is now `glm4:latest`. A Qwen variant that fits in 8 GB must be
-chosen before the study runs; `healthcheck_v30.py` lists the installed models by
-size and marks which ones fit.
-
 ---
 
 ## 2. Three gates, so a broken run costs minutes rather than two days
