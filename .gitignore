@@ -19,3 +19,5 @@ ev_ids_workspace_v6/
 .DS_Store
 .idea/
 .vscode/
+healthcheck_v30.json
+__pycache__/
