@@ -186,6 +186,24 @@ def main():
     check("Stage 2 defaults to the answer channel",
           A.STAGE2_ANSWER_CHANNEL_ONLY, True)
 
+    # 5b ── per-model generation policy. MODEL_GEN_POLICY is substring matched
+    #       with FIRST MATCH WINS, so a specific key placed after a general one
+    #       is silently dead. glm4 and qwen2.5 reject think=True; resolving them
+    #       to the generic 'glm'/'qwen' entries costs a refused request and a
+    #       retry on every single call.
+    check("glm4 does not request the reasoning channel",
+          A.gen_policy_for('glm4:latest')['thinking'], False)
+    check("glm-4.7-flash still requests it",
+          A.gen_policy_for('glm-4.7-flash:latest')['thinking'], True)
+    check("qwen2.5 does not request the reasoning channel",
+          A.gen_policy_for('qwen2.5:7b')['thinking'], False)
+    check("qwen3.5 still requests it",
+          A.gen_policy_for('qwen3.5:latest')['thinking'], True)
+    for specific, general in (('glm4', 'glm'), ('qwen2.5', 'qwen')):
+        keys = list(A.MODEL_GEN_POLICY)
+        check(f"{specific!r} is matched before {general!r}",
+              keys.index(specific) < keys.index(general), True)
+
     # 6 ── SHAP sign convention. The prompt tells the model "+ = toward
     #      Attack", so attributions must be taken against the Attack class for
     #      every model. Indexing by the PREDICTED class instead inverted the

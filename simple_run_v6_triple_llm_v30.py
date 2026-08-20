@@ -1077,9 +1077,13 @@ XAI (SHAP + LIME) — ABLATION SWITCH
     # A model that does not fit is not slow, it is unmeasurable: timed-out
     # calls become ML fallbacks and identical inputs stop giving identical
     # outputs.
+    #   qwen3.5         6.1 GB weights -> 10.3 GB loaded at num_ctx 8192, and
+    #                   only 6.3 GB was free: measured at 2% GPU residency,
+    #                   3 of 4 healthcheck probes timed out, 19.6 h projected
+    #   qwen2.5:7b      4.4 GB weights -> fits, same family, comparable class
     model_ids = {'llama': 'llama3:latest',
                  'glm':   'glm4:latest',
-                 'qwen':  'qwen3.5:latest'}   # used by the run and the sweep
+                 'qwen':  'qwen2.5:7b'}       # used by the run and the sweep
 
     if backend == 'vllm':
         # Pre-flight: vLLM is a separate inference server. It does NOT run

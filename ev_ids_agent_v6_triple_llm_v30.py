@@ -244,13 +244,26 @@ DEFAULT_GEN_POLICY = {
 MODEL_GEN_POLICY = {
     # Substring matched against the model name (lowercased), FIRST MATCH WINS,
     # so more specific keys must come before more general ones.
+    #
+    # qwen2.5 is not a reasoning model and rejects think=True, the same as glm4.
+    # Declaring it removes a refused request and a retry on every single call.
+    # Must precede the generic 'qwen' key.
+    'qwen2.5': {'num_predict': 3072, 'repeat_penalty': 1.10, 'thinking': False},
     'qwen': {'num_predict': 3072, 'repeat_penalty': 1.10, 'thinking': True},
     # glm4 is not a reasoning model and rejects think=True. Measured: the client
     # asked for the reasoning channel, the server refused, and the call was
     # retried without it -- correct behaviour, but a wasted round trip on every
     # single call. Declaring it here removes the round trip. Must precede the
     # generic 'glm' key.
-    'glm4': {'num_predict': 2048, 'repeat_penalty': 1.15, 'thinking': False},
+    # 3072, not 2048. Measured on the healthcheck at num_ctx 8192: the Stage 2
+    # prompt leaves roughly 4,780 tokens of room and NO budget clamp fires, yet
+    # glm4 needed the repair call on 5 of 6 probes -- it was running out of
+    # output before reaching the Prediction line, not out of window. This is the
+    # opposite situation to V29.1, where raising the budget hurt because the
+    # window was 4096 and generation overflowed it. Here the headroom is
+    # measured, so the increase is safe; the healthcheck's direct-vs-repair
+    # counter confirms or refutes it in about ten minutes.
+    'glm4': {'num_predict': 3072, 'repeat_penalty': 1.15, 'thinking': False},
     # GLM measured at ~2,753 words/session against a 2,048-token cap
     # (~1,500 words/stage): it was being truncated BEFORE emitting the verdict
     # line, which is why format compliance sat at 0.26 with 28/50 fallbacks.

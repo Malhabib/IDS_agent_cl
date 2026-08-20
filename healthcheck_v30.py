@@ -37,7 +37,14 @@ import argparse, json, sys, time
 
 import ev_ids_agent_v6_triple_llm_v30 as A
 
-DEFAULT_MODELS = ['llama3:latest', 'glm4:latest', 'qwen3.5:latest']
+# Measured on the target machine (Quadro M4000, 8 GB, 6.3 GB free):
+#   llama3:latest    4.3 GB weights ->  5.3 GB loaded at ctx 8192   100% GPU
+#   glm4:latest      5.1 GB weights ->  5.3 GB loaded at ctx 8192   100% GPU
+#   qwen3.5:latest   6.1 GB weights -> 10.3 GB loaded at ctx 8192     2% GPU
+#   qwen2.5:7b       4.4 GB weights                                 fits
+# qwen3.5 needs 8.3 GB against 6.3 GB free, so it cannot be measured here.
+# qwen2.5:7b is the same family and comparable class, and it fits.
+DEFAULT_MODELS = ['llama3:latest', 'glm4:latest', 'qwen2.5:7b']
 
 # Six unambiguous sessions: three at a delivery ratio of ~1.00 (normal) and
 # three at >=1.5 (energy theft). A model that cannot separate these cannot do
@@ -266,6 +273,31 @@ def probe_prompt(req, dlv):
             f"prediction yet.")
 
 
+FOOTPRINT_CACHE = 'vram_footprints.json'
+
+
+def load_footprints():
+    """Footprints measured by previous healthcheck runs on THIS machine."""
+    try:
+        with open(FOOTPRINT_CACHE, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_footprint(model, weights_gb, loaded_gb, ctx):
+    """Record what this model actually cost in VRAM, so advice stops guessing."""
+    data = load_footprints()
+    data[model] = {'weights_gb': round(weights_gb, 2) if weights_gb else None,
+                   'loaded_gb': round(loaded_gb, 2),
+                   'num_ctx': ctx}
+    try:
+        with open(FOOTPRINT_CACHE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
 def residency(model, base_url):
     """Return (fraction_in_vram, granted_context, total_bytes) from /api/ps."""
     import requests
@@ -386,6 +418,8 @@ def check_model(model, base_url, n_project, timeout):
 
     elapsed = time.time() - t0
     frac, ctx, total = residency(model, base_url)
+    if total:
+        save_footprint(model, None, total / 1024 ** 3, ctx)
     h = client.health()
     med = sorted(latencies)[len(latencies) // 2] if latencies else 0.0
 
@@ -589,39 +623,45 @@ def suggest_fitting_models(broken_models, base_url):
               f"right now ({(total_mib-free_mib)/1024:.1f} GB held by other "
               f"processes)")
     # The figure /api/tags reports is the WEIGHTS on disk. What must fit in VRAM
-    # is the weights PLUS the KV cache, and the KV cache scales with num_ctx.
-    # qwen3.5 is 6.1 GB of weights but /api/ps reported a 10.3 GB footprint at
-    # num_ctx 8192 -- so it is not "larger than the card", it is larger than the
-    # free VRAM once its cache is included. Halving num_ctx roughly halves the
-    # cache, which is a real option this advisor must not obscure.
-    KV_AT_8K = 1.35        # observed multiplier: footprint / weights at 8k ctx
-    KV_AT_4K = 1.18
-    print(f"  'loaded' below = weights x {KV_AT_8K} for the KV cache at "
-          f"num_ctx={A.NUM_CTX}.")
+    # is the weights PLUS the KV cache. An earlier version of this advisor
+    # applied one constant multiplier of 1.35 to every model, and it was simply
+    # wrong: the measured footprint/weights ratio on this machine is 1.04 for
+    # glm4, 1.23 for llama3 and 1.69 for qwen3.5, because the ratio depends on
+    # the attention architecture, not on a rule of thumb. The constant told the
+    # user glm4 would not fit at num_ctx 8192 while /api/ps was simultaneously
+    # reporting it resident at 100% GPU at exactly that context.
+    #
+    # Measured footprints are therefore preferred wherever we have one, and the
+    # estimate is labelled as an estimate wherever we do not.
+    measured = load_footprints()
     free_gb = (free_mib / 1024) if free_mib else None
     card_gb = (total_mib / 1024) if total_mib else None
+    print(f"  'loaded' = the footprint measured by /api/ps at num_ctx="
+          f"{A.NUM_CTX}, or an estimate where none has been measured.")
 
+    fits_now = []
     for name, size in sorted(installed, key=lambda x: x[1]):
         gb = size / 1024 ** 3
-        at8, at4 = gb * KV_AT_8K, gb * KV_AT_4K
-        if card_gb and at4 > card_gb:
-            note = "NEVER fits — exceeds the card even at num_ctx 4096"
-        elif free_gb and at8 > free_gb and at4 <= free_gb:
-            note = f"fits at num_ctx 4096 ({at4:.1f} GB), not at 8192 ({at8:.1f} GB)"
-        elif free_gb and at8 > free_gb:
-            note = f"needs {at8:.1f} GB loaded — free more VRAM"
+        rec = measured.get(name)
+        if rec:
+            loaded, src = rec['loaded_gb'], "measured"
         else:
-            note = f"fits now ({at8:.1f} GB loaded)"
+            loaded, src = gb * 1.35, "est."
+        if card_gb and loaded > card_gb:
+            note = f"NEVER fits — {loaded:.1f} GB exceeds the whole card"
+        elif free_gb and loaded > free_gb:
+            short = loaded - free_gb
+            note = (f"needs {loaded:.1f} GB — free {short:.1f} GB more, or halve "
+                    f"num_ctx")
+        else:
+            note = f"fits now ({loaded:.1f} GB loaded)"
+            fits_now.append(name)
         mark = "  <- currently failing" if name in broken_models else ""
-        print(f"    {name:<26} {gb:5.1f} GB weights   {note}{mark}")
+        print(f"    {name:<26} {gb:5.1f} GB weights  {src:<8} {note}{mark}")
 
-    if free_gb:
-        fits = [n for n, s in installed
-                if (s / 1024**3) * KV_AT_8K <= free_gb]
-        if fits:
-            print(f"\n  Usable right now at num_ctx {A.NUM_CTX}: {', '.join(fits)}")
-        print(f"  Re-check one with:  python healthcheck_v30.py --models <name> "
-              f"--n 50")
+    if fits_now:
+        print(f"\n  Usable right now at num_ctx {A.NUM_CTX}: {', '.join(fits_now)}")
+    print(f"  Re-check one with:  python healthcheck_v30.py --models <name> --n 50")
 
 
 if __name__ == "__main__":
