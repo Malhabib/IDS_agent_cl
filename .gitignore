@@ -21,3 +21,4 @@ ev_ids_workspace_v6/
 .vscode/
 healthcheck_v30.json
 __pycache__/
+healthcheck_transcript_*.txt

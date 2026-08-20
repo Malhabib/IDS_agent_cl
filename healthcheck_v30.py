@@ -151,7 +151,15 @@ CRITICAL RULE
 # healthcheck is to load the context the study will load: it was the SIZE of
 # this prompt, replayed into Stage 2, that collapsed GLM's generation budget to
 # its floor. A short probe would measure latency and miss the actual failure.
-RAG_BLOCK = """RETRIEVED DOMAIN KNOWLEDGE (RAG, top 2 passages)
+#
+# They must also TRACK THE SESSION. The real pipeline picks its RAG query from
+# the delivery ratio -- "energy theft" above 1.3, "phantom charging" below 0.7,
+# "normal charging" in between -- so a normal session is never shown two
+# paragraphs about theft. The previous version of this file fixed the SHAP block
+# to the session but left RAG and memory constant and attack-flavoured. That is
+# a plausible reason Llama answered Attack on all six probes, including the
+# three at ratio ~1.00, and it is the same defect as before in a second place.
+RAG_ATTACK = """RETRIEVED DOMAIN KNOWLEDGE (RAG, top 2 passages, query 'energy theft')
   [1] Energy theft in EV charging infrastructure. Meter-tampering and
       protocol-manipulation attacks cause the station to deliver materially
       more energy than the session authorised. The signature is a
@@ -171,30 +179,91 @@ RAG_BLOCK = """RETRIEVED DOMAIN KNOWLEDGE (RAG, top 2 passages)
       distinguished from an ordinary interrupted session by the absence of a
       corresponding reduction in connection time."""
 
-LTM_BLOCK = """SIMILAR HISTORICAL CASES (long-term memory, 3 nearest)
-  Case 1  requested=11.400 kWh, delivered=11.372 kWh, duration=3.10h
-          Classified Normal: delivered close to requested, ratio 0.998, no
-          anomaly in the energy balance and duration consistent with the
-          delivered amount.
-  Case 2  requested=8.900 kWh, delivered=15.664 kWh, duration=2.80h
-          Classified Attack (energy_theft): delivered 1.760x the authorised
-          amount with an unchanged session envelope, matching the documented
-          meter-tampering signature.
-  Case 3  requested=17.200 kWh, delivered=17.286 kWh, duration=4.40h
-          Classified Normal: ratio 1.005, within meter tolerance."""
+RAG_NORMAL = """RETRIEVED DOMAIN KNOWLEDGE (RAG, top 2 passages, query 'normal charging')
+  [1] Normal EV charging sessions. A session in which the station delivers
+      substantially the energy that was authorised is the expected case. Meter
+      tolerance, cable losses and rounding in the session record routinely
+      produce a delivered/requested ratio a few tenths of a percent either side
+      of 1.0, so a ratio between roughly 0.95 and 1.05 is unremarkable and
+      carries no security significance on its own. Operators see this in the
+      large majority of sessions. Treating small deviations around 1.0 as
+      anomalous is the dominant source of false alarms in deployed detectors,
+      because the deviation is instrumentation noise rather than signal.
+  [2] Session envelope in normal operation. Connection and disconnect times in
+      a normal session bracket a charging period consistent with the energy
+      delivered. Timing features have no physical bearing on whether energy was
+      diverted, so a detector that keys on them rather than on the energy
+      balance will misclassify ordinary sessions. The energy balance is the
+      discriminating measurement; timing is context."""
+
+
+def rag_for(ratio: float) -> str:
+    """Mirror the pipeline's ratio-driven RAG query selection."""
+    if ratio > 1.3 or ratio < 0.7:
+        return RAG_ATTACK
+    return RAG_NORMAL
+
+
+def ltm_for(ratio: float) -> str:
+    """
+    Three recalled cases, nearest to this session.
+
+    Like the RAG block, this has to track the session: the real long-term
+    memory returns cases similar to the one under review, so a normal session
+    recalls mostly normal precedents.
+    """
+    if ratio > 1.3:
+        cases = [(8.900, 15.664, 2.80, "Attack (energy_theft)",
+                  "delivered 1.760x the authorised amount with an unchanged "
+                  "session envelope, matching the documented meter-tampering "
+                  "signature"),
+                 (12.500, 19.375, 3.40, "Attack (energy_theft)",
+                  "ratio 1.550, well outside meter tolerance, energy balance "
+                  "decisive"),
+                 (16.000, 16.080, 4.10, "Normal",
+                  "ratio 1.005, within meter tolerance")]
+    elif ratio < 0.7:
+        cases = [(14.000, 3.640, 3.20, "Attack (phantom_charging)",
+                  "ratio 0.260 with a full-length connection, matching the "
+                  "denial-of-charging signature"),
+                 (9.800, 2.744, 2.90, "Attack (phantom_charging)",
+                  "ratio 0.280, energy delivered far below authorised"),
+                 (11.400, 11.372, 3.10, "Normal",
+                  "ratio 0.998, nothing anomalous")]
+    else:
+        cases = [(11.400, 11.372, 3.10, "Normal",
+                  "delivered close to requested, ratio 0.998, no anomaly in the "
+                  "energy balance and duration consistent with the delivered "
+                  "amount"),
+                 (17.200, 17.286, 4.40, "Normal",
+                  "ratio 1.005, within meter tolerance; small deviations around "
+                  "1.0 are instrumentation noise"),
+                 (6.700, 6.674, 2.20, "Normal",
+                  "ratio 0.996, unremarkable")]
+    out = ["SIMILAR HISTORICAL CASES (long-term memory, 3 nearest)"]
+    for i, (req, dlv, dur, label, why) in enumerate(cases, 1):
+        out.append(f"  Case {i}  requested={req:.3f} kWh, delivered={dlv:.3f} kWh, "
+                   f"duration={dur:.2f}h")
+        out.append(f"          Classified {label}: {why}.")
+    return "\n".join(out)
 
 
 def probe_prompt(req, dlv):
     ratio = dlv / req
+    # The trailing instruction names the STAGE 1 sections only. Stage 1 is
+    # analysis; the verdict belongs to Stage 2, and asking for a prediction here
+    # would contradict the framework's own system prompt.
     return (f"EV CHARGING SESSION\n"
             f"  RequestedDemand : {req:.3f} kWh\n"
             f"  kWhDelivered    : {dlv:.3f} kWh\n"
             f"  delivered/requested = {ratio:.3f}\n\n"
-            f"{RAG_BLOCK}\n\n"
-            f"{LTM_BLOCK}\n\n"
+            f"{rag_for(ratio)}\n\n"
+            f"{ltm_for(ratio)}\n\n"
             f"{evidence_for(ratio)}\n\n"
-            f"Give SHAP_LIME_ASSESSMENT, PHYSICAL_INTERPRETATION, "
-            f"REASONING_SUMMARY, CONFIDENCE and PREDICTION.")
+            f"Provide your Stage 1 analysis in the format given: "
+            f"PHYSICAL_INTERPRETATION, SHAP_LIME_ASSESSMENT, DOMAIN_MATCH, "
+            f"HISTORICAL_CONTEXT and UNCERTAINTY_FACTORS. Do not state a "
+            f"prediction yet.")
 
 
 def residency(model, base_url):
@@ -228,7 +297,9 @@ def check_model(model, base_url, n_project, timeout):
 
     t0 = time.time()
     correct = stated = errors = 0
+    repaired = unrecovered = 0
     latencies = []
+    transcript = []
     consecutive_errors = 0
     n_run = 0
     for req, dlv, truth in PROBES:
@@ -258,19 +329,60 @@ def check_model(model, base_url, n_project, timeout):
             errors += 1
             consecutive_errors += 1
             print(f"    req={req:6.2f} dlv={dlv:6.2f}  ERROR")
+            transcript.append((req, dlv, truth, 'ERROR', s1, s2, ''))
             continue
         consecutive_errors = 0
+
         v = A.extract_verdict(s2)
+        rep = ''
+        if v is None:
+            # The pipeline does not give up here, so neither does the
+            # healthcheck. Omitting the repair call made GLM look as though it
+            # never answers, when the study would have recovered the verdict.
+            repaired += 1
+            rep = client.generate_with_system(
+                system_prompt=("You output exactly one word and nothing else. "
+                               "No reasoning, no punctuation, no explanation."),
+                user_prompt=(f"An analyst reviewed an EV charging session and "
+                             f"wrote:\n\n{(s2 or s1)[-900:]}\n\n"
+                             f"Measured facts: requested {req:.3f} kWh, "
+                             f"delivered {dlv:.3f} kWh "
+                             f"(delivered/requested = {dlv/req:.3f}).\n\n"
+                             f"Answer with ONE word only — Attack or Normal:"),
+                temperature=0.0, max_tokens=64, force_no_think=True)
+            if rep and not rep.startswith(A.LLM_ERROR_PREFIX):
+                v = A.extract_verdict(rep + "\nPrediction: " + rep.strip())
+
         if v is not None:
             stated += 1
             hit = (v == 'Malicious') == (truth == 'Attack')
             correct += hit
+            tag = " (via repair)" if rep else ""
             print(f"    req={req:6.2f} dlv={dlv:6.2f}  ratio={dlv/req:5.3f}  "
-                  f"-> {v:<9} {'ok' if hit else 'WRONG'}  "
+                  f"-> {v:<9} {'ok' if hit else 'WRONG'}{tag}  "
                   f"({latencies[-1]:5.1f}s)")
         else:
-            print(f"    req={req:6.2f} dlv={dlv:6.2f}  NO VERDICT STATED  "
+            unrecovered += 1
+            print(f"    req={req:6.2f} dlv={dlv:6.2f}  NO VERDICT, REPAIR FAILED  "
                   f"({latencies[-1]:5.1f}s)")
+            print(f"      Stage 2 ended: ...{s2[-220:].strip()!r}")
+        transcript.append((req, dlv, truth, v or 'NONE', s1, s2, rep))
+
+    # Always write the raw exchanges. Diagnosing "no verdict stated" from a
+    # counter alone is guesswork; the responses say whether the model refused,
+    # rambled past its budget, or answered in a format the parser missed.
+    tpath = f"healthcheck_transcript_{model.replace(':', '_').replace('/', '_')}.txt"
+    try:
+        with open(tpath, 'w', encoding='utf-8') as f:
+            for req, dlv, truth, verdict, s1, s2, rep in transcript:
+                f.write(f"{'='*78}\nrequested={req} delivered={dlv} "
+                        f"ratio={dlv/req:.3f} truth={truth} -> {verdict}\n"
+                        f"{'='*78}\n\n[STAGE 1 RESPONSE]\n{s1}\n\n"
+                        f"[STAGE 2 RESPONSE]\n{s2}\n\n"
+                        f"[REPAIR]\n{rep}\n\n")
+        print(f"\n    transcript written: {tpath}")
+    except Exception as e:
+        print(f"\n    could not write transcript: {e}")
 
     elapsed = time.time() - t0
     frac, ctx, total = residency(model, base_url)
@@ -287,6 +399,9 @@ def check_model(model, base_url, n_project, timeout):
         'size_gb':        None if not total else round(total / 1024**3, 1),
         'probes_run':     n_run,
         'stated':         f"{stated}/{n_run}",
+        'repaired':       repaired,
+        'unrecovered':    unrecovered,
+        'transcript':     tpath,
         'correct':        f"{correct}/{n_run}",
         'errors':         errors,
         'budget_clamps':  h['budget_clamps'],
@@ -299,7 +414,10 @@ def check_model(model, base_url, n_project, timeout):
           f"{'unknown' if frac is None else f'{frac*100:.0f}%'}"
           f"{'' if not total else f'  ({total/1024**3:.1f} GB)'}")
     print(f"    granted context   : {ctx}  (requested {A.NUM_CTX})")
-    print(f"    verdict stated    : {stated}/{n_run}")
+    print(f"    verdict obtained  : {stated}/{n_run}"
+          f"  (direct {stated-max(0, repaired-unrecovered)}, "
+          f"via repair {max(0, repaired-unrecovered)}, "
+          f"unrecovered {unrecovered})")
     print(f"    correct           : {correct}/{n_run}")
     print(f"    LLM errors        : {errors}  (timeouts {h['timeouts']})")
     print(f"    budget clamps     : {h['budget_clamps']}")
@@ -333,9 +451,13 @@ def check_model(model, base_url, n_project, timeout):
         env.append(f"projected {projected_h:.1f} h for {n_project} sessions")
 
     answered = n_run - errors
-    if answered and stated < answered:
-        behav.append(f"only {stated} of {answered} answered probes stated a "
-                     f"verdict; the rest would be scored as fallbacks")
+    if answered and unrecovered:
+        behav.append(f"{unrecovered} of {answered} answered probes produced no "
+                     f"verdict even after the repair call; the study would score "
+                     f"those as ML fallbacks (see {tpath})")
+    elif answered and repaired:
+        behav.append(f"{repaired} of {answered} needed the repair call to state a "
+                     f"verdict; the direct Stage 2 format was not followed")
     if answered and correct <= answered // 2:
         behav.append(f"{correct}/{answered} correct on unambiguous sessions")
     if answered and correct == answered and answered >= 4:
@@ -461,32 +583,45 @@ def suggest_fitting_models(broken_models, base_url):
     except Exception:
         pass
 
-    print(f"\n  MODELS INSTALLED, BY SIZE")
+    print(f"\n  MODELS INSTALLED, BY WEIGHT SIZE")
     if total_mib:
         print(f"  GPU: {total_mib/1024:.1f} GB total, {free_mib/1024:.1f} GB free "
               f"right now ({(total_mib-free_mib)/1024:.1f} GB held by other "
               f"processes)")
-    # Roughly 15% headroom for the KV cache at an 8k context.
-    budget_gb = (free_mib / 1024 * 0.85) if free_mib else None
-    card_gb   = (total_mib / 1024 * 0.85) if total_mib else None
+    # The figure /api/tags reports is the WEIGHTS on disk. What must fit in VRAM
+    # is the weights PLUS the KV cache, and the KV cache scales with num_ctx.
+    # qwen3.5 is 6.1 GB of weights but /api/ps reported a 10.3 GB footprint at
+    # num_ctx 8192 -- so it is not "larger than the card", it is larger than the
+    # free VRAM once its cache is included. Halving num_ctx roughly halves the
+    # cache, which is a real option this advisor must not obscure.
+    KV_AT_8K = 1.35        # observed multiplier: footprint / weights at 8k ctx
+    KV_AT_4K = 1.18
+    print(f"  'loaded' below = weights x {KV_AT_8K} for the KV cache at "
+          f"num_ctx={A.NUM_CTX}.")
+    free_gb = (free_mib / 1024) if free_mib else None
+    card_gb = (total_mib / 1024) if total_mib else None
 
     for name, size in sorted(installed, key=lambda x: x[1]):
         gb = size / 1024 ** 3
-        if card_gb and gb > card_gb:
-            note = "NEVER fits — larger than the card"
-        elif budget_gb and gb > budget_gb:
-            note = "fits only if you free VRAM"
+        at8, at4 = gb * KV_AT_8K, gb * KV_AT_4K
+        if card_gb and at4 > card_gb:
+            note = "NEVER fits — exceeds the card even at num_ctx 4096"
+        elif free_gb and at8 > free_gb and at4 <= free_gb:
+            note = f"fits at num_ctx 4096 ({at4:.1f} GB), not at 8192 ({at8:.1f} GB)"
+        elif free_gb and at8 > free_gb:
+            note = f"needs {at8:.1f} GB loaded — free more VRAM"
         else:
-            note = "fits now"
+            note = f"fits now ({at8:.1f} GB loaded)"
         mark = "  <- currently failing" if name in broken_models else ""
-        print(f"    {name:<26} {gb:5.1f} GB   {note}{mark}")
+        print(f"    {name:<26} {gb:5.1f} GB weights   {note}{mark}")
 
-    if budget_gb:
-        fits = [n for n, s in installed if s / 1024**3 <= budget_gb]
+    if free_gb:
+        fits = [n for n, s in installed
+                if (s / 1024**3) * KV_AT_8K <= free_gb]
         if fits:
-            print(f"\n  Usable right now: {', '.join(fits)}")
-        print(f"  Pass a replacement with:  python healthcheck_v30.py "
-              f"--models <name> --n 50")
+            print(f"\n  Usable right now at num_ctx {A.NUM_CTX}: {', '.join(fits)}")
+        print(f"  Re-check one with:  python healthcheck_v30.py --models <name> "
+              f"--n 50")
 
 
 if __name__ == "__main__":

@@ -93,14 +93,24 @@ Measured on the target machine (Quadro M4000, 8 GB):
 | `llama3:latest` | 5.2 GB | 100% GPU, ctx 8192 | usable |
 | `glm4:latest` | 5.3 GB | 100% GPU, ctx 8192 | usable |
 | `glm-4.7-flash:latest` | 19 GB | 67%/33% CPU/GPU | 2.4x the card — never fits |
-| `qwen3.5:latest` | 10.3 GB | **2% GPU** | larger than the card — never fits |
+| `qwen3.5:latest` | 6.1 GB weights / 10.3 GB loaded | **2% GPU** | weights fit; weights + 8k KV cache do not |
 
-`qwen3.5` is the important one. At 10.3 GB it exceeds the entire 8 GB card, so
-no amount of closing applications will make it fit. Every previous Qwen result,
-including the 1.0000, was produced by a model running almost entirely on the
-CPU. That does not make the outputs wrong — CPU inference is still inference —
-but it is the direct source of the multi-day runtime, and it means Qwen was
-never measured under the same conditions as the other two models.
+`qwen3.5` is the important one, and it needs care: `ollama list` reports
+**6.1 GB**, which is the weights on disk, while `/api/ps` reported a **10.3 GB**
+footprint — weights plus the KV cache at `num_ctx 8192`. The weights alone fit
+in 8 GB; the loaded model does not fit in the 6.3 GB that was free. So this is
+not "larger than the card": it is recoverable by freeing the remaining VRAM, or
+by halving `num_ctx`, which roughly halves the cache.
+
+What is not recoverable is the past data. Every previous Qwen result, including
+the 1.0000, was produced by a model running at ~2% GPU residency. That does not
+make the outputs wrong — CPU inference is still inference — but it is the direct
+source of the multi-day runtime, and it means Qwen was never measured under the
+same conditions as the other two models.
+
+The advisor in `healthcheck_v30.py` now distinguishes weights from loaded
+footprint and states which models fit at 8192, which fit only at 4096, and which
+cannot fit at all.
 
 The GLM default is now `glm4:latest`. A Qwen variant that fits in 8 GB must be
 chosen before the study runs; `healthcheck_v30.py` lists the installed models by
@@ -134,21 +144,38 @@ three within minutes of starting:
 | all | granted context varying with free VRAM | healthcheck (granted ctx column) |
 | all | model not resident in VRAM → hours per session | healthcheck (projected hours) |
 
-### A note on the healthcheck's own first version
+### A note on the healthcheck's own probes
 
-The first version of `healthcheck_v30.py` used one fixed evidence block for all
-six probes. A normal session at ratio 1.004 was therefore shown SHAP values
-pointing toward Attack, and an attack at 1.780 was shown a vote tally of
-"0 Attack, 4 Normal". Its accuracy column measured whether a model could resolve
-deliberately contradictory evidence — not whether it could do the task — and it
-made Llama look worse (4/6) and GLM look constant-Normal (3/6) for reasons that
-were the probe's fault. Its prompt was also 1,445 characters against the study's
-~10,900, so it did not exercise the Stage 2 squeeze it exists to detect.
+The healthcheck needed two rounds of correction, both the same defect in
+different places, and both found by running it rather than by reading it.
 
-Both are fixed: the evidence block now tracks the session as SHAP does on real
-data, the prompts are the framework's own system prompt and Stage 2 question,
-and `selftest_v30.py` asserts the consistency so it cannot regress. Any
-correctness figure from a healthcheck run before this fix should be discarded.
+**Round one.** One fixed evidence block was used for all six probes, so a normal
+session at ratio 1.004 was shown SHAP values pointing toward Attack and an
+attack at 1.780 was shown a vote tally of "0 Attack, 4 Normal". Its accuracy
+column measured contradiction-resolution, not the task. Its prompt was also
+1,445 characters against the study's ~10,900, so it did not exercise the Stage 2
+squeeze it exists to detect.
+
+**Round two.** The SHAP block was fixed to track the session, but the RAG and
+long-term-memory blocks were left constant and attack-flavoured — so a
+ratio-1.004 session was still being shown two paragraphs about energy theft and
+a recalled case of meter tampering. The real pipeline picks its RAG query from
+the ratio, so it never does this. Llama answered Attack on all six probes under
+those conditions, which is not evidence about Llama.
+
+Also corrected in round two: the healthcheck omitted the pipeline's repair call,
+so a model that needed one was recorded as never answering; and the Stage 1
+instruction asked for a prediction, contradicting the framework's own system
+prompt, which reserves the verdict for Stage 2.
+
+Every block now tracks the session, the repair call is included, and
+`selftest_v30.py` asserts all of it — 75 assertions — so it cannot regress.
+Raw Stage 1, Stage 2 and repair responses are written to
+`healthcheck_transcript_<model>.txt` on every run, because diagnosing "no
+verdict stated" from a counter alone is guesswork.
+
+**Any correctness figure from a healthcheck run before these fixes should be
+discarded.**
 
 ### The in-run circuit breaker
 

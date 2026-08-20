@@ -240,6 +240,21 @@ def main():
 
         check("normal probe shows no Attack votes", tally(1.004), 0)
         check("attack probe shows Attack votes", tally(1.780) >= 2, True)
+        # EVERY block must track the session, not just the SHAP one. Fixing the
+        # SHAP block while leaving RAG and memory attack-flavoured still shows a
+        # ratio-1.004 session two paragraphs about energy theft.
+        check("normal probe retrieves normal-charging knowledge",
+              'normal charging' in H.rag_for(1.004), True)
+        check("attack probe retrieves energy-theft knowledge",
+              'energy theft' in H.rag_for(1.780), True)
+        check("normal probe recalls no attack precedents",
+              H.ltm_for(1.004).count('Classified Attack'), 0)
+        check("attack probe recalls attack precedents",
+              H.ltm_for(1.780).count('Classified Attack') >= 2, True)
+        check("phantom-charging probe retrieves attack knowledge",
+              'Phantom charging' in H.rag_for(0.26), True)
+        check("Stage 1 probe does not ask for a prediction",
+              'prediction yet' in H.probe_prompt(12.0, 18.0), True)
         check("both 1.5 probes agree", tally(1.5) == tally(22.80 / 15.20), True)
         check("SHAP points toward Attack on an attack", dlv_shap(1.78) > 0.1, True)
         check("SHAP is near zero on a normal", abs(dlv_shap(1.004)) < 0.01, True)
