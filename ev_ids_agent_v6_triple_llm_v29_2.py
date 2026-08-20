@@ -178,7 +178,7 @@ MODEL_GEN_POLICY = {
     # GLM consumed all 4096 tokens on the reasoning channel and returned an
     # empty answer, measured at ~5,000 words of reasoning per session. It needs
     # headroom to finish reasoning and still write the verdict.
-    'glm':  {'num_predict': 8192, 'repeat_penalty': 1.20, 'thinking': True},
+    'glm':  {'num_predict': 1536, 'repeat_penalty': 1.20, 'thinking': True},
     'llama': {'num_predict': 2048, 'repeat_penalty': 1.15, 'thinking': False},
 }
 
@@ -348,6 +348,26 @@ class OllamaClient:
         except ImportError:
             raise ImportError("Ollama library not installed. Run: pip install ollama")
 
+    @staticmethod
+    def _fit_budget(messages, num_ctx, requested):
+        """
+        Keep prompt + generation inside the context window.
+
+        Ollama silently caps num_ctx when VRAM is short: a 19 GB model on this
+        machine reported CONTEXT 4096 despite 8192 being requested. With a
+        ~2,400-token prompt that leaves roughly 1,700 tokens for output, so a
+        num_predict of 8192 cannot be honoured. Generation overflows, Ollama
+        evicts the oldest tokens -- the system prompt and the SHAP evidence --
+        and the model finishes reasoning about a prompt it can no longer see.
+        That is why enlarging GLM's budget degraded its accuracy instead of
+        improving it. The budget is therefore clamped to what actually fits.
+        """
+        approx_prompt = sum(len(m.get('content', '')) for m in messages) // 4
+        room = num_ctx - approx_prompt - 128          # margin for chat scaffolding
+        if room < 128:
+            room = 128
+        return max(64, min(requested, room))
+
     def _call(self, messages, temperature, max_tokens, force_no_think=False):
         # Per-model generation policy: a runaway-loop guard that is invisible to
         # models generating normal-length answers.
@@ -359,6 +379,11 @@ class OllamaClient:
             options['temperature'] = temp
         if max_tokens is not None:          # explicit override (repair call)
             options['num_predict'] = max_tokens
+        fitted = self._fit_budget(messages, NUM_CTX, options['num_predict'])
+        if fitted < options['num_predict']:
+            print(f"    [BUDGET] num_predict {options['num_predict']} -> {fitted} "
+                  f"so prompt + output fit in num_ctx={NUM_CTX}")
+        options['num_predict'] = fitted
         kwargs = dict(model=self.model_name, messages=messages,
                       options=options, keep_alive=KEEP_ALIVE)
         # force_no_think: for a trivial read-out ("Attack or Normal?") the
