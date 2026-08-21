@@ -1146,6 +1146,13 @@ XAI (SHAP + LIME) — ABLATION SWITCH
             print("  [WARN] ACCURACY RISK: Ollama splits the KV cache across parallel\n"
                   "         slots, so each request may get a fraction of num_ctx and the\n"
                   "         SHAP/LIME evidence can be truncated. Use 1 for best accuracy.")
+            print("  [WARN] On an 8 GB card this re-creates the exact bug V30 fixed.\n"
+                  "         A granted window of 4096 instead of 8192 collapses the\n"
+                  "         Stage 2 generation budget to its 128-token floor, which is\n"
+                  "         what produced GLM's empty answers and made two runs of\n"
+                  "         identical code at temperature 0 disagree. Check the\n"
+                  "         'granted context' line in healthcheck_v30.py output at the\n"
+                  "         worker count you intend to use before trusting the results.")
 
     # SELF-CONSISTENCY (V27 accuracy enhancement; pipeline unchanged)
     print("""
