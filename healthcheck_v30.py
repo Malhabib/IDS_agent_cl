@@ -621,6 +621,7 @@ def main():
         return 2
 
     sample = probe_prompt(12.0, 18.0)
+    print(f"\n{A.config_banner(tuple(args.models))}")
     print(f"\n  V30 HEALTHCHECK")
     print(f"  {len(PROBES)} unambiguous probe sessions per model, full two-stage "
           f"pipeline.")

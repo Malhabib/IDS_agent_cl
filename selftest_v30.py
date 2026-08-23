@@ -377,6 +377,8 @@ def main():
         FAIL.append(f"runner import failed: {e}")
 
     # ── report ──────────────────────────────────────────────────────────────
+    # Printed first so a stale copy is obvious before any result is read.
+    print(f"\n{A.config_banner()}")
     print(f"\n  V30 OFFLINE SELF-TEST")
     print(f"  {'-'*66}")
     print(f"  passed : {len(PASS)}")

@@ -382,6 +382,37 @@ MODEL_GEN_POLICY = {
 }
 
 
+def config_banner(models=('llama3:latest', 'glm-4.7-flash:latest',
+                          'qwen3.5:latest')) -> str:
+    """
+    The settings this file will actually apply, with a fingerprint.
+
+    Stale copies have cost this project several runs: a healthcheck was run
+    twice against a file whose num_predict had supposedly been raised, and the
+    two runs produced byte-identical reasoning lengths because the change had
+    never reached the machine. There was no way to tell at a glance which
+    version was executing. Now there is, and the fingerprint changes whenever
+    any generation setting does.
+    """
+    import hashlib
+    payload = repr(sorted(MODEL_GEN_POLICY.items())) + repr(DEFAULT_GEN_POLICY)
+    fp = hashlib.sha256(payload.encode()).hexdigest()[:8]
+    lines = [f"  EFFECTIVE CONFIG   fingerprint {fp}",
+             f"  {'-'*62}",
+             f"  num_ctx {NUM_CTX}   timeout "
+             f"{'none' if LLM_CALL_TIMEOUT_SEC is None else str(LLM_CALL_TIMEOUT_SEC)+'s'}"
+             f"   temperature {LLM_TEMPERATURE}"]
+    for m in models:
+        p = gen_policy_for(m)
+        lines.append(f"  {m:<24} num_predict={p['num_predict']:<5} "
+                     f"repeat_penalty={p['repeat_penalty']:<5} "
+                     f"thinking={'ON' if p['thinking'] else 'OFF'}")
+    env = [f"{k}={v}" for k, v in sorted(os.environ.items())
+           if k.startswith('EV_IDS_')]
+    lines.append(f"  overrides: {', '.join(env) if env else 'none'}")
+    return "\n".join(lines)
+
+
 def gen_policy_for(model_name: str) -> dict:
     n = (model_name or "").lower()
     for key, pol in MODEL_GEN_POLICY.items():
