@@ -377,7 +377,20 @@ MODEL_GEN_POLICY = {
     # Every failure ended after ATTACK_TYPE, which is the section immediately
     # before the Prediction line -- the model ran out of budget mid-format, it
     # did not decline to answer.
-    'glm':  {'num_predict': 3072, 'repeat_penalty': 1.05, 'thinking': True},
+    #
+    # 3072 -> 4096. Measured progression on six identical probes, same
+    # hardware, temperature 0 -- every difference below is CONFIGURATION, not
+    # the model:
+    #     repeat_penalty 1.20, num_predict 1536 -> 0/6 stated, token corruption
+    #     repeat_penalty 1.05, num_predict 1536 -> 3/6 stated, 3/6 correct
+    #     repeat_penalty 1.05, num_predict 3072 -> 5/6 stated, 5/6 correct
+    # The single remaining failure produced 5,889 characters of Stage 2
+    # reasoning plus a long answer and stopped after ATTACK_TYPE, one line
+    # before the Prediction, with no budget clamp. At the longest Stage 1
+    # response observed (7,656 chars) the window still leaves ~3,870 tokens, so
+    # _fit_budget clamps 4096 down to what actually fits and the request costs
+    # nothing when the response is shorter.
+    'glm':  {'num_predict': 4096, 'repeat_penalty': 1.05, 'thinking': True},
     'llama': {'num_predict': 2048, 'repeat_penalty': 1.15, 'thinking': False},
 }
 
@@ -1605,7 +1618,7 @@ class EVIDSAgentV6TripleLLMV30:
         #
         # 256 is still trivially small next to a Stage 2 budget of 3072, and it
         # leaves room for a model that thinks briefly before answering "Attack".
-        return 256
+        return 512
 
     def _log(self, msg):
         """Buffer one console line for this session.
@@ -2147,9 +2160,23 @@ Provide your structured analysis using the format in your instructions."""
                 temperature=0.0, max_tokens=self._repair_budget(),
                 force_no_think=True)
             if repair and not repair.startswith(LLM_ERROR_PREFIX):
-                stage2_response = stage2_response + "\nPrediction: " + repair.strip()
-                repair_used = extract_verdict(stage2_response) is not None
-                self._log(f"  [REPAIR] Recovered: {repair.strip()[:60]}")
+                # A model that reasons even when asked not to returns its
+                # reasoning here rather than one word. Splicing that whole blob
+                # in after "Prediction: " produced a line the verdict pattern
+                # could not match, so a repair that HAD reached a conclusion was
+                # still recorded as a failure. Read the repair on its own terms
+                # first, and only then append a clean, parseable verdict line.
+                verdict = extract_verdict(repair) or extract_verdict(
+                    "Prediction: " + repair.strip())
+                if verdict:
+                    stage2_response += ("\nPrediction: "
+                                        + ('Attack' if verdict == 'Malicious'
+                                           else 'Normal'))
+                    repair_used = True
+                    self._log(f"  [REPAIR] Recovered: {verdict}")
+                else:
+                    self._log(f"  [REPAIR] No verdict in the repair either: "
+                              f"{repair.strip()[:80]}")
 
         # Self-consistency (V26 enhancement, pipeline unchanged): for AMBIGUOUS
         # sessions only, re-ask Stage 2 a few times and take the majority

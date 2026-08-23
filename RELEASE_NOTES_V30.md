@@ -43,6 +43,39 @@ the reasoning belongs and Stage 2 is a commitment step; and disabling the
 reasoning channel outright below `THINK_MIN_BUDGET` (512) rather than letting it
 consume a budget too small to finish in.
 
+### 1.1b GLM's poor scores since V23 were configuration, not the model
+
+Six identical probes, one machine, temperature 0. Every difference below comes
+from settings in this repository:
+
+| repeat_penalty | num_predict | stated | correct | what happened |
+|---|---|---|---|---|
+| 1.20 | 1536 | 0/6 | 0/6 | token corruption, model confused by its own output |
+| 1.05 | 1536 | 3/6 | 3/6 | corruption gone; answers truncated |
+| 1.05 | 3072 | **5/6** | **5/6** | all direct, no repair needed |
+
+Two independent faults, both ours:
+
+**repeat_penalty 1.20** was the highest of any model, applied to the model whose
+reasoning channel quotes the evidence block most heavily. Every repeated token
+was penalised and the sampler was pushed off the correct spelling onto a near
+miss — `"RequestedD emand"`, `"kWhDeli vered"`, `"Delivrerd Energy"` — after
+which GLM reasoned about corruption it had produced itself. It was raised to
+1.20 to break a runaway generation loop that `num_predict` already bounds.
+
+**num_predict 1536** was left behind when the sibling `glm4` key was raised to
+3072, so `glm-4.7-flash` never received the fix. It binds because this model
+emits its reasoning channel even when `think=True` is not requested, and that
+reasoning is billed against the same budget as the answer. The probes divided
+exactly on reasoning length, and every failure stopped after `ATTACK_TYPE` — the
+section immediately before the `Prediction` line. The model ran out of budget
+mid-format; it never declined to answer.
+
+This is the single most consequential finding in the V30 work. GLM was reported
+as the weak model in every version from V23 onward — 24/50 unparseable, 28/50
+fallbacks, accuracy 0.46–0.66 — and those numbers measured a misconfiguration.
+Any GLM comparison in earlier drafts should be withdrawn rather than reinterpreted.
+
 ### 1.2 The granted context varies between runs — and that is the irreproducibility
 
 | run | GLM | Llama |

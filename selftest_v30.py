@@ -227,7 +227,20 @@ def main():
               pol['repeat_penalty'] <= 1.15, True)
     # The repair read-out must outlast a model that reasons anyway.
     check("the repair budget survives an unrequested reasoning channel",
-          A.EVIDSAgentV6TripleLLMV30._repair_budget(None) >= 128, True)
+          A.EVIDSAgentV6TripleLLMV30._repair_budget(None) >= 256, True)
+    # A repair that returns reasoning instead of one word must still be read.
+    # Splicing the whole blob after "Prediction: " produced an unmatchable line,
+    # so a repair that HAD concluded was recorded as a failure.
+    for blob, want in [
+        ("Attack", 'Malicious'),
+        ("  Normal  ", 'Normal'),
+        ("The ratio is 1.78, far above 1.0.\nPrediction: Attack", 'Malicious'),
+        ("Given the delivery ratio, this is an attack.\nAttack", 'Malicious'),
+        ("mumbling with no conclusion at all", None),
+    ]:
+        got = A.extract_verdict(blob) or A.extract_verdict(
+            "Prediction: " + blob.strip())
+        check(f"repair blob {blob[:34]!r} reads as {want}", got, want)
 
     # 6 ── SHAP sign convention. The prompt tells the model "+ = toward
     #      Attack", so attributions must be taken against the Attack class for

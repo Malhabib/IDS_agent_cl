@@ -453,9 +453,15 @@ def check_model(model, base_url, n_project, timeout):
                              f"delivered {dlv:.3f} kWh "
                              f"(delivered/requested = {dlv/req:.3f}).\n\n"
                              f"Answer with ONE word only — Attack or Normal:"),
-                temperature=0.0, max_tokens=64, force_no_think=True)
+                temperature=0.0, max_tokens=A.EVIDSAgentV6TripleLLMV30
+                                            ._repair_budget(None),
+                force_no_think=True)
             if rep and not rep.startswith(A.LLM_ERROR_PREFIX):
-                v = A.extract_verdict(rep + "\nPrediction: " + rep.strip())
+                # Same reading as the pipeline: take the repair on its own
+                # terms first, so a reasoning blob that reaches a conclusion is
+                # not scored as a failure to answer.
+                v = A.extract_verdict(rep) or A.extract_verdict(
+                    "Prediction: " + rep.strip())
 
         if v is not None:
             stated += 1
