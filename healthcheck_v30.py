@@ -37,14 +37,14 @@ import argparse, json, sys, time
 
 import ev_ids_agent_v6_triple_llm_v30 as A
 
-# Measured on the target machine (Quadro M4000, 8 GB, 6.3 GB free):
-#   llama3:latest    4.3 GB weights ->  5.3 GB loaded at ctx 8192   100% GPU
-#   glm4:latest      5.1 GB weights ->  5.3 GB loaded at ctx 8192   100% GPU
-#   qwen3.5:latest   6.1 GB weights -> 10.3 GB loaded at ctx 8192     2% GPU
-#   qwen2.5:7b       4.4 GB weights                                 fits
-# qwen3.5 needs 8.3 GB against 6.3 GB free, so it cannot be measured here.
-# qwen2.5:7b is the same family and comparable class, and it fits.
-DEFAULT_MODELS = ['llama3:latest', 'glm4:latest', 'qwen2.5:7b']
+# The study's TARGET models. The healthcheck's job is to report whether this
+# machine can measure them -- not to quietly propose easier ones. Results from
+# different models are not comparable, so a substitution changes what the study
+# is about and belongs in the write-up as a documented deviation, never in a
+# default. Where a target does not fit, the levers are, in order: free VRAM,
+# lower num_ctx (--num-ctx, down to the minimum this prompt actually needs),
+# or a larger GPU.
+DEFAULT_MODELS = ['llama3:latest', 'glm-4.7-flash:latest', 'qwen3.5:latest']
 
 # Six unambiguous sessions: three at a delivery ratio of ~1.00 (normal) and
 # three at >=1.5 (energy theft). A model that cannot separate these cannot do
@@ -531,7 +531,23 @@ def main():
     ap.add_argument('--n', type=int, default=50,
                     help='sample size you intend to run, for the cost projection')
     ap.add_argument('--timeout', type=int, default=A.LLM_CALL_TIMEOUT_SEC)
+    ap.add_argument('--num-ctx', type=int, default=None,
+                    help='context window to test; lowering it shrinks the KV '
+                         'cache so a target model can fit without being replaced')
     args = ap.parse_args()
+
+    if args.num_ctx:
+        floor = A.min_viable_num_ctx()
+        if args.num_ctx < floor:
+            print(f"\n  --num-ctx {args.num_ctx} is below the pipeline floor of "
+                  f"{floor}.\n  Stage 2 replays the system prompt, the Stage 1 "
+                  f"prompt, the Stage 1 response\n  and the question; below "
+                  f"{floor} there is no room left to write a verdict.")
+            return 2
+        A.NUM_CTX = args.num_ctx
+        print(f"\n  Testing at num_ctx={args.num_ctx} (floor {floor}). A smaller "
+              f"window means a\n  smaller KV cache, so a target model may fit "
+              f"where it did not at 8192.")
 
     # A gate that passes when it checked nothing is worse than no gate.
     if not args.models:

@@ -61,7 +61,8 @@ from ev_ids_agent_v6_triple_llm_v30 import (
     make_llm_client, EVIDSAgentV6TripleLLMV30, build_xai_store,
     unload_ollama_model,
     auto_train_models_v6, get_column_mapping, classify_difficulty_zone,
-    parse_datetime_to_timestamp, SHAP_AVAILABLE, LIME_AVAILABLE
+    parse_datetime_to_timestamp, SHAP_AVAILABLE, LIME_AVAILABLE,
+    NUM_CTX, min_viable_num_ctx
 )
 
 PRINT_LOCK = threading.Lock()
@@ -1148,13 +1149,21 @@ XAI (SHAP + LIME) — ABLATION SWITCH
     # A model that does not fit is not slow, it is unmeasurable: timed-out
     # calls become ML fallbacks and identical inputs stop giving identical
     # outputs.
-    #   qwen3.5         6.1 GB weights -> 10.3 GB loaded at num_ctx 8192, and
-    #                   only 6.3 GB was free: measured at 2% GPU residency,
-    #                   3 of 4 healthcheck probes timed out, 19.6 h projected
-    #   qwen2.5:7b      4.4 GB weights -> fits, same family, comparable class
+    # THESE ARE THE STUDY'S TARGET MODELS. They are not chosen for convenience
+    # and must not be substituted to make a run fit a particular GPU: results
+    # from different models are not comparable, so a silent substitution would
+    # change what the study measures. If a target model does not fit, the fix
+    # is to give it more VRAM or a smaller num_ctx -- not a different model.
+    # A substitution, if one is genuinely necessary, is a documented deviation
+    # to be reported in the write-up, not a default.
+    #
+    # Measured footprints at num_ctx 8192 (see healthcheck_v30.py):
+    #   llama3          4.7 GB weights ->  5.3 GB loaded
+    #   qwen3.5         6.6 GB weights -> 10.3 GB loaded
+    #   glm-4.7-flash  19.0 GB weights -> needs a 24 GB card
     model_ids = {'llama': 'llama3:latest',
-                 'glm':   'glm4:latest',
-                 'qwen':  'qwen2.5:7b'}       # used by the run and the sweep
+                 'glm':   'glm-4.7-flash:latest',
+                 'qwen':  'qwen3.5:latest'}   # used by the run and the sweep
 
     if backend == 'vllm':
         # Pre-flight: vLLM is a separate inference server. It does NOT run
@@ -1317,6 +1326,16 @@ RUN MODE
         # Cheapest check first: a name that does not exist cannot be measured.
         if verify_models_installed(model_ids, base_url):
             print(f"\n  Aborted before any GPU time was spent.")
+            return
+        floor = min_viable_num_ctx()
+        print(f"\n  Context window: {NUM_CTX} "
+              f"(minimum this pipeline can work in: {floor})")
+        if NUM_CTX < floor:
+            print(f"  [ABORT] EV_IDS_NUM_CTX={NUM_CTX} is below the floor. Stage 2 "
+                  f"replays the\n          system prompt, the Stage 1 prompt, the "
+                  f"Stage 1 response and the\n          question; below {floor} "
+                  f"there is no room left to write a verdict and\n          the "
+                  f"model returns reasoning with no answer.")
             return
         degraded = preflight_gpu_residency(model_ids, base_url)
         if degraded:

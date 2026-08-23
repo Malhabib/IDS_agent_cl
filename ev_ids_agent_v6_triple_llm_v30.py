@@ -173,7 +173,42 @@ STAGE2_MAX_TOKENS = None
 # Greedy decoding is materially better for this task, so it is the default.
 # The temperature sweep overrides this per cell.
 LLM_TEMPERATURE   = 0.0
-NUM_CTX           = 8192      # only enlarges the window; never truncates
+
+# ── CONTEXT WINDOW ───────────────────────────────────────────────────────────
+# The KV cache scales with num_ctx, so this is the one knob that changes how
+# much VRAM a model needs WITHOUT changing which model is used. That matters:
+# the study's three target models are fixed by the research question, and
+# swapping one to fit a GPU would change what is being measured. Lowering
+# num_ctx is the correct lever; substituting a model is not.
+#
+# Override for a tight card:   set EV_IDS_NUM_CTX=6144     (Windows)
+#                              export EV_IDS_NUM_CTX=6144  (Linux/macOS)
+#
+# There is a floor. Stage 2 replays the system prompt, the Stage 1 prompt, the
+# whole Stage 1 response and the Stage 2 question, then still needs room to
+# answer. Below MIN_VIABLE_NUM_CTX the budget clamp collapses to its floor and
+# the model returns reasoning with no verdict -- the original GLM failure.
+# min_viable_num_ctx() computes the real floor from the real prompt sizes.
+NUM_CTX = int(os.environ.get('EV_IDS_NUM_CTX', '8192'))
+
+
+def min_viable_num_ctx(stage1_prompt_chars: int = 8600,
+                       system_chars: int = 3928,
+                       stage2_question_chars: int = 523,
+                       stage1_response_tokens: int = 2048,
+                       answer_tokens: int = 512) -> int:
+    """
+    Smallest context window in which Stage 2 can still write a verdict.
+
+    Stage 2 is the binding case, not Stage 1: it carries the system prompt, the
+    Stage 1 prompt, the Stage 1 response and the question, and only what is left
+    can hold the answer. Rounded up to the next multiple of 1024, since Ollama
+    allocates the cache in blocks.
+    """
+    prompt_tokens = (system_chars + stage1_prompt_chars
+                     + stage2_question_chars) // 4
+    need = prompt_tokens + stage1_response_tokens + answer_tokens + 128
+    return int(-(-need // 1024) * 1024)
 # keep_alive: how long Ollama keeps a model resident after a request.
 # V27 used "30m", which was a serious mistake for a THREE-model study: the
 # runner works through Llama -> GLM -> Qwen, so with a 30-minute hold all

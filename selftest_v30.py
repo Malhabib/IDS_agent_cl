@@ -183,6 +183,16 @@ def main():
           fit(dummy, long_prompt, 6000, 1536), 1147)
     check("THINK_MIN_BUDGET is above the floor",
           A.THINK_MIN_BUDGET > 128, True)
+    # num_ctx is the lever that makes a TARGET model fit. Substituting a model
+    # changes what the study measures; shrinking the window does not. But the
+    # window has a real floor, because Stage 2 replays everything Stage 1 saw.
+    floor = A.min_viable_num_ctx()
+    check("the context floor leaves room for an answer",
+          fit(dummy, [{'content': 'x' * 8600}, {'content': 'x' * 3928},
+                      {'content': 'x' * 523}, {'content': 'x' * 8192}],
+              floor, 1536) >= A.THINK_MIN_BUDGET, True)
+    check("the default window is at or above the floor", A.NUM_CTX >= floor, True)
+    check("the floor is a whole number of 1024-token blocks", floor % 1024, 0)
     check("Stage 2 defaults to the answer channel",
           A.STAGE2_ANSWER_CHANNEL_ONLY, True)
 

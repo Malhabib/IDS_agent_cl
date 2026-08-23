@@ -114,6 +114,35 @@ cannot fit at all.
 
 ---
 
+## 1.6 The target models are fixed; num_ctx is the lever
+
+The study's three models — `llama3`, `glm-4.7-flash`, `qwen3.5` — are set by the
+research question. Results from different models are not comparable, so
+swapping one to make a run fit a particular GPU changes what is being measured.
+An earlier revision of this file defaulted to `glm4` and `qwen2.5:7b` because
+they fit an 8 GB card. That was the wrong trade: it silently altered the study
+to suit the hardware. The defaults are back to the targets.
+
+Where a target does not fit, the levers are, in order:
+
+1. **Free VRAM.** Desktop applications held 1.7–7.7 GB on the test machine.
+2. **Lower `num_ctx`.** The KV cache scales with the window, so this changes
+   the VRAM a model needs *without changing the model*.
+   `set EV_IDS_NUM_CTX=6144`, or `healthcheck_v30.py --num-ctx 6144`.
+3. **A larger GPU.** `glm-4.7-flash` is 19 GB and needs a 24 GB card.
+
+`num_ctx` has a hard floor, computed by `min_viable_num_ctx()` from the actual
+prompt sizes: Stage 2 replays the system prompt, the Stage 1 prompt, the whole
+Stage 1 response and the question, and what remains must still hold a verdict.
+That floor is **6144**. Below it the budget clamp collapses and the model
+returns reasoning with no answer — the original GLM failure, reached by a
+different route. Both the runner and the healthcheck refuse to run below it.
+
+A substitution, if one is genuinely unavoidable, is a documented deviation to
+be reported in the write-up — not a default.
+
+---
+
 ## 2. Three gates, so a broken run costs minutes rather than two days
 
 Run them in order. Each must exit 0 before the next is worth running.
