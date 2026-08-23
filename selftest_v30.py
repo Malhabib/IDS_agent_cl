@@ -289,10 +289,27 @@ def main():
 
     # 9 ── the runner imports what it says it imports
     try:
+        import inspect
         import simple_run_v6_triple_llm_v30 as R
         for fn in ('preflight_gpu_residency', 'check_gpu_residency',
-                   'calculate_metrics', 'run_classification', 'main'):
+                   'verify_models_installed', 'calculate_metrics',
+                   'run_classification', 'main'):
             check(f"runner.{fn} exists", hasattr(R, fn), True)
+
+        # The circuit breaker was originally written into the serial branch
+        # only, so a run at workers=8 with a 28% error rate went all 50
+        # sessions and cost an hour before reporting itself unpublishable. A
+        # guard that covers one code path is not a guard, and nothing but this
+        # assertion would have noticed.
+        src = inspect.getsource(R.run_classification)
+        serial, parallel = src.split('    else:', 1)
+        check("circuit breaker guards the serial path",
+              '_breaker()' in serial, True)
+        check("circuit breaker guards the PARALLEL path",
+              '_breaker()' in parallel, True)
+        check("the parallel path cancels queued work when it trips",
+              'cancel' in parallel, True)
+        check("llm errors are counted in progress", 'llm_error' in src, True)
     except Exception as e:
         FAIL.append(f"runner import failed: {e}")
 

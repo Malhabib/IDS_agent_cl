@@ -99,6 +99,57 @@ def check_available_models(ollama_url="http://localhost:11434"):
         return []
 
 
+def verify_models_installed(model_ids, base_url="http://localhost:11434"):
+    """
+    Confirm every model the run needs actually exists on THIS machine.
+
+    Without this, a missing model is discovered only when its turn comes. On a
+    three-model study that means the first model runs to completion -- an hour
+    -- and only then does the second fail with a 404 and get skipped, leaving
+    an incomplete result set and an hour of wasted GPU time. Model names are
+    also not portable between machines: a configuration validated on one box
+    referenced glm4 and qwen2.5:7b, neither of which was installed on the next.
+
+    Returns the list of missing (slot, name) pairs; prints what IS installed and
+    the exact pull commands.
+    """
+    import requests
+    try:
+        tags = requests.get(f"{base_url}/api/tags", timeout=10).json()
+    except Exception as e:
+        print(f"  Could not list models: {e}")
+        return []
+    installed = {}
+    for m in tags.get('models', []):
+        name = m.get('name') or m.get('model')
+        if name:
+            installed[name] = float(m.get('size', 0) or 0)
+
+    missing = [(slot, name) for slot, name in model_ids.items()
+               if name not in installed]
+    if not missing:
+        print(f"\n  All {len(model_ids)} configured models are installed.")
+        return []
+
+    print(f"\n  MISSING MODELS — the run would fail partway through")
+    print(f"  {'-'*66}")
+    for slot, name in missing:
+        print(f"    {slot:<6} {name:<26} NOT INSTALLED")
+    print(f"\n  Installed on this machine:")
+    for name, size in sorted(installed.items(), key=lambda kv: kv[1]):
+        gb = size / 1024 ** 3
+        cloud = " (cloud — runs remotely, uses no local VRAM)" if size == 0 else ""
+        print(f"    {name:<26} {gb:5.1f} GB{cloud}")
+    print(f"\n  Either install what the study expects:")
+    for _, name in missing:
+        print(f"    ollama pull {name.split(':')[0] if name.endswith(':latest') else name}")
+    print(f"  or edit model_ids in main() to use models you already have.")
+    print(f"\n  Installing the same models on every machine is strongly preferred:")
+    print(f"  results from different models are not comparable, so substituting")
+    print(f"  one silently would make the two machines' numbers incommensurable.")
+    return missing
+
+
 def check_gpu_residency(model_name, base_url="http://localhost:11434"):
     """Load one model and report how much of it Ollama placed in VRAM.
 
@@ -448,15 +499,35 @@ def run_classification(agent, emoji, label, selected, df, workers=1):
         # Parallel: memory-off scenarios only (enforced by caller). The full
         # V23 per-session trace is still printed — each session is buffered by
         # the agent and flushed as one contiguous block under the print lock.
+        #
+        # The circuit breaker MUST run here too. It was originally written only
+        # into the serial branch above, so a run at workers=8 with a 28% LLM
+        # error rate went the full 50 sessions and cost an hour before reporting
+        # that it was unpublishable. A guard that only guards one code path is
+        # not a guard.
         order = {idx: i for i, idx in enumerate(selected)}
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(_classify_one, agent, idx, truths[idx]): idx
                     for idx in selected}
-            for fut in as_completed(futs):
-                row = fut.result()
-                if row is not None:
-                    results.append(row)
-                    _progress(row)
+            try:
+                for fut in as_completed(futs):
+                    row = fut.result()
+                    if row is not None:
+                        results.append(row)
+                        _progress(row)
+                    aborted = _breaker()
+                    if aborted:
+                        print(f"\n  [CIRCUIT BREAKER] {label} stopping after "
+                              f"{done} of {total} sessions.\n    {aborted}")
+                        print(f"    Cancelling queued sessions. Run 'python "
+                              f"healthcheck_v30.py' to confirm the cause.")
+                        for f in futs:
+                            f.cancel()
+                        break
+            finally:
+                # Threads already running cannot be cancelled, so the pool is
+                # drained rather than left to finish silently in the background.
+                pool.shutdown(wait=True, cancel_futures=True)
         results.sort(key=lambda r: order[r['index']])
 
     cc = sum(1 for r in results if r['correct'])
@@ -1130,7 +1201,16 @@ XAI (SHAP + LIME) — ABLATION SWITCH
   concurrent requests. For Ollama you must set this BEFORE starting it:
       Windows:  setx OLLAMA_NUM_PARALLEL 4     (then restart Ollama)
   Otherwise requests queue and you see bursts of N finishing together.
-  The full V23 per-session trace is printed either way.""")
+  The full V23 per-session trace is printed either way.
+
+  MEASURED CONSEQUENCE — a run at workers=8 on an 8 GB card produced
+  15 timeouts and 14 of 50 sessions with no LLM answer at all. Those
+  sessions were labelled by the ML majority, so the reported 96.0%
+  described the fallback, not the model, and the run was unpublishable.
+  Parallel slots share one KV cache: each worker gets a fraction of
+  num_ctx, generation is starved, and calls run past the deadline.
+  Use 1 unless you have verified the granted context at your worker
+  count with healthcheck_v30.py.""")
         try:
             workers = int(input("Parallel workers (1=sequential, 2-8) [1]: ").strip() or "1")
         except ValueError:
@@ -1153,6 +1233,10 @@ XAI (SHAP + LIME) — ABLATION SWITCH
                   "         identical code at temperature 0 disagree. Check the\n"
                   "         'granted context' line in healthcheck_v30.py output at the\n"
                   "         worker count you intend to use before trusting the results.")
+            if input(f"  Type 'yes' to run with {workers} workers anyway: ")\
+                    .strip().lower() != 'yes':
+                workers = 1
+                print("  Using workers=1.")
 
     # SELF-CONSISTENCY (V27 accuracy enhancement; pipeline unchanged)
     print("""
@@ -1229,6 +1313,10 @@ RUN MODE
             check_available_models(base_url)
         except Exception as e:
             print(f"\nOllama error: {e}")
+            return
+        # Cheapest check first: a name that does not exist cannot be measured.
+        if verify_models_installed(model_ids, base_url):
+            print(f"\n  Aborted before any GPU time was spent.")
             return
         degraded = preflight_gpu_residency(model_ids, base_url)
         if degraded:
