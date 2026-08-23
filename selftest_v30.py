@@ -214,6 +214,21 @@ def main():
         check(f"{specific!r} is matched before {general!r}",
               keys.index(specific) < keys.index(general), True)
 
+    # A specific key was raised to 3072 while its general sibling was left at
+    # 1536, so glm-4.7-flash kept the old budget and kept truncating one line
+    # before the verdict. Nothing flagged the divergence. Every model must have
+    # room for its reasoning channel AND the five-section Stage 2 format.
+    for name in ('glm-4.7-flash:latest', 'glm4:latest', 'qwen3.5:latest',
+                 'qwen2.5:7b', 'llama3:latest'):
+        pol = A.gen_policy_for(name)
+        check(f"{name} has a workable Stage 2 budget",
+              pol['num_predict'] >= 2048, True)
+        check(f"{name} repeat_penalty is not aggressive enough to corrupt tokens",
+              pol['repeat_penalty'] <= 1.15, True)
+    # The repair read-out must outlast a model that reasons anyway.
+    check("the repair budget survives an unrequested reasoning channel",
+          A.EVIDSAgentV6TripleLLMV30._repair_budget(None) >= 128, True)
+
     # 6 ── SHAP sign convention. The prompt tells the model "+ = toward
     #      Attack", so attributions must be taken against the Attack class for
     #      every model. Indexing by the PREDICTED class instead inverted the

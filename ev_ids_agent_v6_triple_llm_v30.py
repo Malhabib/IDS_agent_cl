@@ -361,7 +361,23 @@ MODEL_GEN_POLICY = {
     # highest penalty of any model here and was applied to the model that
     # quotes the most. The value was originally raised to break a runaway
     # generation loop, but num_predict already bounds that.
-    'glm':  {'num_predict': 1536, 'repeat_penalty': 1.05, 'thinking': True},
+    #
+    # num_predict 1536 -> 3072. When glm4 was raised to 3072 this generic 'glm'
+    # entry was left behind, so glm-4.7-flash never received the fix. Measured
+    # at the granted ctx 8192: the Stage 2 prompt is ~3,890 tokens, leaving
+    # ~4,174 of room, and NO budget clamp fires -- 1536 was self-imposed, not a
+    # window limit.
+    #
+    # It is the binding constraint because this model emits its reasoning
+    # channel even when think=True is not requested, and that reasoning is
+    # billed against the same num_predict as the answer. The six probes divide
+    # exactly on reasoning length:
+    #     THINK-2  2721 / 3620 / 3631 chars -> verdict written
+    #     THINK-2  3368 / 4245 / 6381 chars -> stopped one line short
+    # Every failure ended after ATTACK_TYPE, which is the section immediately
+    # before the Prediction line -- the model ran out of budget mid-format, it
+    # did not decline to answer.
+    'glm':  {'num_predict': 3072, 'repeat_penalty': 1.05, 'thinking': True},
     'llama': {'num_predict': 2048, 'repeat_penalty': 1.15, 'thinking': False},
 }
 
@@ -1548,9 +1564,17 @@ class EVIDSAgentV6TripleLLMV30:
         writes any content, so a 24-token repair budget guarantees an empty
         answer. Thinking models therefore need room to think AND answer.
         """
-        # The read-out runs with force_no_think, so the reasoning channel is not
-        # in play and a small budget suffices for every model.
-        return 64
+        # 64 was chosen on the assumption that force_no_think removes the
+        # reasoning channel. It does not for every model: glm-4.7-flash emitted
+        # 253-337 characters of reasoning on each repair call despite
+        # force_no_think, which is roughly 70-85 tokens and consumed the entire
+        # 64-token budget before a single word of answer. The repair then
+        # returned empty and the session fell through to the ML majority -- so
+        # the recovery path was failing for exactly the models that needed it.
+        #
+        # 256 is still trivially small next to a Stage 2 budget of 3072, and it
+        # leaves room for a model that thinks briefly before answering "Attack".
+        return 256
 
     def _log(self, msg):
         """Buffer one console line for this session.
