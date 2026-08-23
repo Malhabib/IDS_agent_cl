@@ -331,6 +331,62 @@ def residency(model, base_url):
     return None, None, None
 
 
+def assess(*, frac, total, ctx, errors, n_run, stated, correct, unrecovered,
+           repaired, clamps, projected_h, n_project, cloud, transcript_path):
+    """
+    Turn one model's measurements into a verdict. Pure, so it can be tested
+    against real recorded numbers instead of only against a live GPU.
+
+    Returns (verdict, environment_problems, behaviour_notes, caveats) where
+    verdict is 'FAIL' (the environment cannot measure this model), 'WEAK' (it
+    was measured and performed poorly, which is a result) or 'GO'.
+
+    Partial VRAM residency is a CAVEAT, not a failure. It makes a model slower
+    and lets the granted context vary between runs, but it does not by itself
+    invalidate anything: llama3 at 76% residency on a 6 GB card produced 6/6
+    direct verdicts, 6/6 correct, zero timeouts, zero budget clamps and a 2.1 h
+    projection. Failing that on the proxy would have blocked a usable
+    configuration. The gate judges OUTCOMES; residency is reported so it can be
+    stated in the write-up.
+    """
+    env, behav, caveat = [], [], []
+
+    if not cloud and frac is not None and frac < 0.999:
+        caveat.append(f"only {frac*100:.0f}% of the model is in VRAM"
+                      + (f" ({total/1024**3:.1f} GB)" if total else "")
+                      + "; it is running partly on the CPU, so it is slower than "
+                        "it could be and its granted context may vary between "
+                        "runs. Report this alongside the results.")
+    if not cloud and ctx and ctx < A.NUM_CTX:
+        env.append(f"Ollama granted a {ctx}-token context against a request of "
+                   f"{A.NUM_CTX}, which starves the Stage 2 budget")
+    if errors:
+        env.append(f"{errors} of {n_run} probes failed or timed out")
+    if clamps > n_run:
+        env.append(f"{clamps} generation-budget clamps: the prompt is crowding "
+                   f"out the answer")
+    if projected_h > 6:
+        env.append(f"projected {projected_h:.1f} h for {n_project} sessions")
+
+    answered = n_run - errors
+    if answered and unrecovered:
+        behav.append(f"{unrecovered} of {answered} answered probes produced no "
+                     f"verdict even after the repair call; the study would score "
+                     f"those as ML fallbacks (see {transcript_path})")
+    elif answered and repaired:
+        behav.append(f"{repaired} of {answered} needed the repair call to state a "
+                     f"verdict; the direct Stage 2 format was not followed")
+    if answered and correct <= answered // 2:
+        behav.append(f"{correct}/{answered} correct on unambiguous sessions")
+    if answered and correct == answered and answered >= 4:
+        behav.append(f"{correct}/{answered} — note that these probes are "
+                     f"deliberately easy, so this is a floor, not a score")
+
+    verdict = 'FAIL' if env else ('WEAK' if behav and any(
+        'correct' in b and 'floor' not in b for b in behav) else 'GO')
+    return verdict, env, behav, caveat
+
+
 def check_model(model, base_url, n_project, timeout):
     print(f"\n  {'='*72}\n  {model}\n  {'='*72}")
     row = {'model': model}
@@ -491,40 +547,28 @@ def check_model(model, base_url, n_project, timeout):
               f"residency\n    checks do not apply. Note that the prompts, "
               f"including the session data\n    and the SHAP/LIME evidence, "
               f"leave this machine.")
-    if not cloud and frac is not None and frac < 0.999:
-        env.append(f"only {frac*100:.0f}% of the model is in VRAM; the rest runs "
-                   f"on the CPU"
-                   + (f" (the model is {total/1024**3:.1f} GB)" if total else ""))
-    if not cloud and ctx and ctx < A.NUM_CTX:
-        env.append(f"Ollama granted a {ctx}-token context against a request of "
-                   f"{A.NUM_CTX}, which starves the Stage 2 budget")
-    if errors:
-        env.append(f"{errors} of {n_run} probes failed or timed out")
-    if h['budget_clamps'] > n_run:
-        env.append(f"{h['budget_clamps']} generation-budget clamps: the prompt is "
-                   f"crowding out the answer")
-    if projected_h > 6:
-        env.append(f"projected {projected_h:.1f} h for {n_project} sessions")
-
-    answered = n_run - errors
-    if answered and unrecovered:
-        behav.append(f"{unrecovered} of {answered} answered probes produced no "
-                     f"verdict even after the repair call; the study would score "
-                     f"those as ML fallbacks (see {tpath})")
-    elif answered and repaired:
-        behav.append(f"{repaired} of {answered} needed the repair call to state a "
-                     f"verdict; the direct Stage 2 format was not followed")
-    if answered and correct <= answered // 2:
-        behav.append(f"{correct}/{answered} correct on unambiguous sessions")
-    if answered and correct == answered and answered >= 4:
-        behav.append(f"{correct}/{answered} — note that these probes are "
-                     f"deliberately easy, so this is a floor, not a score")
-
-    row['verdict']     = 'FAIL' if env else ('WEAK' if behav and any(
-        'correct' in b and 'floor' not in b for b in behav) else 'GO')
+    # Partial residency is a RISK FACTOR, not an outcome. It makes a model slow
+    # and makes the granted context vary, but it does not by itself invalidate a
+    # run: llama3 at 76% residency on a 6 GB card produced 6/6 direct verdicts,
+    # 6/6 correct, zero timeouts, zero budget clamps and a 2.1 h projection --
+    # every observable measure clean. Failing that on the proxy alone would have
+    # blocked a usable configuration. The gate therefore judges the OUTCOMES
+    # (timeouts, unrecovered verdicts, a short-granted window, projected hours)
+    # and reports residency as a caveat that belongs in the write-up.
+    verdict, env, behav, caveat = assess(
+        frac=frac, total=total, ctx=ctx, errors=errors, n_run=n_run,
+        stated=stated, correct=correct, unrecovered=unrecovered,
+        repaired=repaired, clamps=h['budget_clamps'], projected_h=projected_h,
+        n_project=n_project, cloud=cloud, transcript_path=tpath)
+    row['verdict']     = verdict
     row['environment'] = env
     row['behaviour']   = behav
+    row['caveats']     = caveat
 
+    if caveat:
+        print(f"\n    CAVEAT (does not block the run; report it):")
+        for p in caveat:
+            print(f"      - {p}")
     if env:
         print(f"\n    NO-GO — ENVIRONMENT (nothing measured here is trustworthy):")
         for p in env:
@@ -595,10 +639,15 @@ def main():
           f"{'err':>4} {'sec':>7} {'proj h':>7}  verdict")
     for r in rows:
         vram = 'n/a' if r.get('in_vram') is None else f"{r['in_vram']*100:.0f}%"
+        flag = '*' if r.get('caveats') else ''
         print(f"  {r['model']:<20} {vram:>6} {str(r.get('granted_ctx','n/a')):>6} "
               f"{str(r.get('stated','-')):>7} {str(r.get('correct','-')):>8} "
               f"{str(r.get('errors','-')):>4} {str(r.get('median_sec','-')):>7} "
-              f"{str(r.get('projected_hours','-')):>7}  {r['verdict']}")
+              f"{str(r.get('projected_hours','-')):>7}  {r['verdict']}{flag}")
+    if any(r.get('caveats') for r in rows):
+        print(f"\n  * runs, but not fully in VRAM. Slower than it could be, and "
+              f"the granted\n    context may vary between runs — report the "
+              f"residency with the results.")
 
     with open('healthcheck_v30.json', 'w') as f:
         json.dump(rows, f, indent=2)

@@ -291,6 +291,36 @@ def main():
               H.is_cloud_model('x:latest', 0), True)
         check("a local model is not treated as cloud",
               H.is_cloud_model('glm-4.7-flash:latest', 19e9), False)
+
+        # The gate must judge OUTCOMES, not the residency proxy. These are the
+        # real recorded numbers from a 6 GB machine at num_ctx 6144.
+        def verdict(**kw):
+            base = dict(frac=1.0, total=5.5e9, ctx=A.NUM_CTX, errors=0, n_run=6,
+                        stated=6, correct=6, unrecovered=0, repaired=0, clamps=0,
+                        projected_h=2.1, n_project=50, cloud=False,
+                        transcript_path='t.txt')
+            return H.assess(**{**base, **kw})
+
+        v, env, _, cav = verdict(frac=0.76, projected_h=2.1)
+        check("76% residency with clean outcomes is a GO", v, 'GO')
+        check("...and is reported as a caveat", len(cav), 1)
+        check("...with no environment failure", env, [])
+
+        v, env, _, _ = verdict(frac=0.57, errors=2, n_run=2, stated=0, correct=0,
+                               projected_h=16.5)
+        check("timeouts still FAIL", v, 'FAIL')
+
+        v, _, behav, _ = verdict(frac=0.22, stated=0, correct=0, unrecovered=6,
+                                 projected_h=11.3)
+        check("no verdict after repair FAILs on projected hours", v, 'FAIL')
+        check("...and records the behaviour", len(behav) >= 1, True)
+
+        v, env, _, cav = verdict(frac=None, total=0, cloud=True)
+        check("a cloud model gets no residency caveat", cav, [])
+        check("a cloud model is not failed for residency", v, 'GO')
+
+        v, env, _, _ = verdict(ctx=4096)
+        check("a short-granted window still FAILs", v, 'FAIL')
         check("both 1.5 probes agree", tally(1.5) == tally(22.80 / 15.20), True)
         check("SHAP points toward Attack on an attack", dlv_shap(1.78) > 0.1, True)
         check("SHAP is near zero on a normal", abs(dlv_shap(1.004)) < 0.01, True)

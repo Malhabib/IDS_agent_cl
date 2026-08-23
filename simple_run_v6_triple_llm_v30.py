@@ -1157,13 +1157,35 @@ XAI (SHAP + LIME) — ABLATION SWITCH
     # A substitution, if one is genuinely necessary, is a documented deviation
     # to be reported in the write-up, not a default.
     #
-    # Measured footprints at num_ctx 8192 (see healthcheck_v30.py):
-    #   llama3          4.7 GB weights ->  5.3 GB loaded
-    #   qwen3.5         6.6 GB weights -> 10.3 GB loaded
-    #   glm-4.7-flash  19.0 GB weights -> needs a 24 GB card
+    # Measured loaded footprints (see healthcheck_v30.py and vram_footprints.json):
+    #                     @num_ctx 8192   @num_ctx 6144
+    #   llama3                  5.5 GB          5.2 GB
+    #   qwen3.5                 5.8 GB          5.8 GB
+    #   glm-4.7-flash          18.3 GB         18.2 GB   (17.7 GB of weights)
+    #
+    # glm-4.7-flash cannot be made to fit a 6 GB or an 8 GB card by any window
+    # setting, because the weights alone exceed both. It needs roughly a 24 GB
+    # GPU, or the cloud variant, which runs full-size weights remotely.
+    #
+    # Set EV_IDS_NUM_CTX=6144 on a tight card: it is the pipeline floor and it
+    # shrinks the KV cache without changing which models are used.
     model_ids = {'llama': 'llama3:latest',
                  'glm':   'glm-4.7-flash:latest',
                  'qwen':  'qwen3.5:latest'}   # used by the run and the sweep
+
+    # A per-machine override, so a second machine does not need the file edited.
+    #   set EV_IDS_MODELS=llama3:latest,glm-5:cloud,qwen3.5:latest
+    _override = os.environ.get('EV_IDS_MODELS', '').strip()
+    if _override:
+        parts = [p.strip() for p in _override.split(',') if p.strip()]
+        if len(parts) == 3:
+            model_ids = dict(zip(('llama', 'glm', 'qwen'), parts))
+            print(f"\n  EV_IDS_MODELS override in effect: {model_ids}")
+            print(f"  Any substitution away from the study's target models is a")
+            print(f"  documented deviation and must be reported with the results.")
+        else:
+            print(f"\n  [WARN] EV_IDS_MODELS needs exactly 3 comma-separated names "
+                  f"(llama,glm,qwen); got {len(parts)}. Ignoring it.")
 
     if backend == 'vllm':
         # Pre-flight: vLLM is a separate inference server. It does NOT run
