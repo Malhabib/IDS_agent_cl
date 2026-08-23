@@ -189,7 +189,26 @@ LLM_TEMPERATURE   = 0.0
 # answer. Below MIN_VIABLE_NUM_CTX the budget clamp collapses to its floor and
 # the model returns reasoning with no verdict -- the original GLM failure.
 # min_viable_num_ctx() computes the real floor from the real prompt sizes.
-NUM_CTX = int(os.environ.get('EV_IDS_NUM_CTX', '8192'))
+def _env_num(name, default, cast=int):
+    """
+    Read a numeric override, tolerating the ways shells leave one empty.
+
+    'set EV_IDS_TIMEOUT=' on Windows leaves the variable defined and empty, and
+    int('') raises at import time -- the module would fail to load before any
+    diagnostic could run. A bad value falls back to the default with a warning
+    rather than taking the whole framework down.
+    """
+    raw = (os.environ.get(name) or '').strip()
+    if not raw:
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        print(f"[WARN] {name}={raw!r} is not a number — using {default}")
+        return default
+
+
+NUM_CTX = _env_num('EV_IDS_NUM_CTX', 8192)
 
 
 def min_viable_num_ctx(stage1_prompt_chars: int = 8600,
@@ -237,7 +256,19 @@ REPAIR_MAX_TOKENS = 24        # tiny follow-up that asks only for the verdict
 # V30 gives every call a deadline and, when it is missed, records the session
 # as an LLM ERROR that is reported separately and never silently scored as a
 # model decision. See LLM_CALL_TIMEOUT_SEC and the llm_error verdict source.
-LLM_CALL_TIMEOUT_SEC = 300    # per call; a healthy session is 10-60 s
+# Override for a deliberately slow configuration:
+#   set EV_IDS_TIMEOUT=1200        (Windows)     0 disables the deadline
+#
+# Raising it is legitimate. Every version up to V29.2 had NO deadline at all,
+# which is why those runs completed on hardware that could not hold the model:
+# they simply took as long as they took, and that is where the multi-day
+# runtimes came from. A longer deadline reproduces that behaviour knowingly.
+# What it does not do is make the results faster to obtain or easier to defend:
+# a model at partial residency is slow, and the per-call time varies with
+# whatever else is using the GPU.
+LLM_CALL_TIMEOUT_SEC = _env_num('EV_IDS_TIMEOUT', 300)
+if LLM_CALL_TIMEOUT_SEC <= 0:
+    LLM_CALL_TIMEOUT_SEC = None   # no deadline, exactly like V23 through V29.2
 LLM_ERROR_PREFIX     = "Error:"
 
 # A thinking model bills its reasoning channel against the SAME num_predict as
@@ -316,7 +347,21 @@ MODEL_GEN_POLICY = {
     # a model that fits in VRAM (so 8192 is actually granted) and Stage 2 running
     # on the answer channel only. 1536 is retained because it is a proven
     # runaway-loop guard, not because it limits anything in a healthy run.
-    'glm':  {'num_predict': 1536, 'repeat_penalty': 1.20, 'thinking': True},
+    #
+    # repeat_penalty lowered 1.20 -> 1.05. GLM produced token-level corruption
+    # of words it was quoting back from the prompt:
+    #     "RequestedD emand"   "kWhDeli vered"   "Requeste dDemand"
+    #     "Delivrerd Energy"   "Requestedmemand"
+    # and then reasoned about the corruption it had itself produced ("It seems
+    # to be split across lines", "I am seeing a pattern of hallucinations in my
+    # thought trace"). That is the signature of an aggressive repetition
+    # penalty, not of a confused model: GLM's reasoning channel quotes the
+    # evidence block repeatedly, every repeated token is penalised, and the
+    # sampler is pushed off the correct spelling onto a near-miss. 1.20 was the
+    # highest penalty of any model here and was applied to the model that
+    # quotes the most. The value was originally raised to break a runaway
+    # generation loop, but num_predict already bounds that.
+    'glm':  {'num_predict': 1536, 'repeat_penalty': 1.05, 'thinking': True},
     'llama': {'num_predict': 2048, 'repeat_penalty': 1.15, 'thinking': False},
 }
 
@@ -494,7 +539,7 @@ class OllamaClient:
                   f"num_predict={self.policy['num_predict']}, "
                   f"repeat_penalty={self.policy['repeat_penalty']}, "
                   f"temperature={'default' if temperature is None else temperature}, "
-                  f"timeout={self.timeout}s)")
+                  f"timeout={'none' if self.timeout is None else f'{self.timeout}s'})")
         except ImportError:
             raise ImportError("Ollama library not installed. Run: pip install ollama")
 

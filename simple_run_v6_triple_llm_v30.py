@@ -62,7 +62,7 @@ from ev_ids_agent_v6_triple_llm_v30 import (
     unload_ollama_model,
     auto_train_models_v6, get_column_mapping, classify_difficulty_zone,
     parse_datetime_to_timestamp, SHAP_AVAILABLE, LIME_AVAILABLE,
-    NUM_CTX, min_viable_num_ctx
+    NUM_CTX, min_viable_num_ctx, _env_num
 )
 
 PRINT_LOCK = threading.Lock()
@@ -73,7 +73,9 @@ PRINT_LOCK = threading.Lock()
 # stop a slow run, they stop a broken one.
 BREAKER_MIN_SESSIONS   = 5      # never judge on fewer than this
 BREAKER_MAX_ERROR_RATE = 0.20   # >20% of sessions with no LLM answer
-BREAKER_MAX_HOURS      = 8.0    # projected wall-clock for the whole model
+# Projected wall-clock for one model before the breaker trips. Raise it to
+# accept a deliberately slow configuration:  set EV_IDS_MAX_HOURS=24
+BREAKER_MAX_HOURS      = _env_num('EV_IDS_MAX_HOURS', 8.0, float)
 
 
 def check_available_models(ollama_url="http://localhost:11434"):
