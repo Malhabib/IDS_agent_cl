@@ -276,6 +276,22 @@ def probe_prompt(req, dlv):
 FOOTPRINT_CACHE = 'vram_footprints.json'
 
 
+def is_cloud_model(name: str, size_bytes: float = None) -> bool:
+    """
+    Ollama cloud models run on Ollama's servers, not on this GPU.
+
+    They matter here because a target model that cannot fit any local card --
+    glm-4.7-flash is 17.7 GB of weights against a 6 GB and an 8 GB machine --
+    can still be run at full size remotely. That is not a substitution to a
+    weaker model; it is the same model class on adequate hardware, which is
+    exactly what the study needs.
+
+    Local VRAM checks are meaningless for them and must be skipped rather than
+    reported as "unknown residency", which would read as a fault.
+    """
+    return name.endswith(':cloud') or (size_bytes is not None and size_bytes == 0)
+
+
 def load_footprints():
     """Footprints measured by previous healthcheck runs on THIS machine."""
     try:
@@ -469,11 +485,17 @@ def check_model(model, base_url, n_project, timeout):
     #                legitimate negative finding, provided the environment was
     #                sound when it was measured.
     env, behav = [], []
-    if frac is not None and frac < 0.999:
+    cloud = is_cloud_model(model, total)
+    if cloud:
+        print(f"    CLOUD MODEL — runs on Ollama's servers, so local VRAM and "
+              f"residency\n    checks do not apply. Note that the prompts, "
+              f"including the session data\n    and the SHAP/LIME evidence, "
+              f"leave this machine.")
+    if not cloud and frac is not None and frac < 0.999:
         env.append(f"only {frac*100:.0f}% of the model is in VRAM; the rest runs "
                    f"on the CPU"
                    + (f" (the model is {total/1024**3:.1f} GB)" if total else ""))
-    if ctx and ctx < A.NUM_CTX:
+    if not cloud and ctx and ctx < A.NUM_CTX:
         env.append(f"Ollama granted a {ctx}-token context against a request of "
                    f"{A.NUM_CTX}, which starves the Stage 2 budget")
     if errors:
@@ -663,8 +685,14 @@ def suggest_fitting_models(broken_models, base_url):
             loaded, src = rec['loaded_gb'], "measured"
         else:
             loaded, src = gb * 1.35, "est."
+        if is_cloud_model(name, size):
+            print(f"    {name:<26} {'—':>5}          cloud    runs remotely, uses "
+                  f"no local VRAM")
+            fits_now.append(name)
+            continue
         if card_gb and loaded > card_gb:
-            note = f"NEVER fits — {loaded:.1f} GB exceeds the whole card"
+            note = (f"NEVER fits — {loaded:.1f} GB exceeds the whole card; no "
+                    f"num_ctx helps ({gb:.1f} GB of weights alone)")
         elif free_gb and loaded > free_gb:
             short = loaded - free_gb
             note = (f"needs {loaded:.1f} GB — free {short:.1f} GB more, or halve "
@@ -678,6 +706,23 @@ def suggest_fitting_models(broken_models, base_url):
     if fits_now:
         print(f"\n  Usable right now at num_ctx {A.NUM_CTX}: {', '.join(fits_now)}")
     print(f"  Re-check one with:  python healthcheck_v30.py --models <name> --n 50")
+
+    # A model whose WEIGHTS exceed the card cannot be rescued by any window
+    # setting, so say so rather than leaving --num-ctx as an implied remedy.
+    hopeless = [n for n, s in installed
+                if not is_cloud_model(n, s) and card_gb and s / 1024**3 > card_gb]
+    if hopeless:
+        print(f"\n  Beyond rescue on this GPU — the weights alone exceed the card,")
+        print(f"  so lowering num_ctx cannot help: {', '.join(hopeless)}")
+        cloud_alts = [n for n, s in installed if is_cloud_model(n, s)]
+        if cloud_alts:
+            print(f"  A cloud model runs the full-size weights remotely: "
+                  f"{', '.join(cloud_alts)}.")
+            print(f"  That keeps the model class the study specifies instead of "
+                  f"substituting a\n  smaller one, at the cost of sending prompts "
+                  f"off this machine.")
+        print(f"  Otherwise the options are a GPU with enough VRAM, or a "
+              f"substitution\n  recorded as a documented deviation.")
 
 
 if __name__ == "__main__":

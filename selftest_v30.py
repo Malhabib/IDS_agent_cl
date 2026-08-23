@@ -283,6 +283,14 @@ def main():
               'Phantom charging' in H.rag_for(0.26), True)
         check("Stage 1 probe does not ask for a prediction",
               'prediction yet' in H.probe_prompt(12.0, 18.0), True)
+        # Cloud models run remotely, so local VRAM checks are meaningless for
+        # them and must be skipped rather than reported as a fault. They are the
+        # only way to run a model whose weights exceed every local card.
+        check("a :cloud model is recognised", H.is_cloud_model('glm-5:cloud'), True)
+        check("a zero-size model is recognised as cloud",
+              H.is_cloud_model('x:latest', 0), True)
+        check("a local model is not treated as cloud",
+              H.is_cloud_model('glm-4.7-flash:latest', 19e9), False)
         check("both 1.5 probes agree", tally(1.5) == tally(22.80 / 15.20), True)
         check("SHAP points toward Attack on an attack", dlv_shap(1.78) > 0.1, True)
         check("SHAP is near zero on a normal", abs(dlv_shap(1.004)) < 0.01, True)
