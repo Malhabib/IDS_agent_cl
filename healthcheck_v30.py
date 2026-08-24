@@ -275,6 +275,14 @@ def probe_prompt(req, dlv):
 
 FOOTPRINT_CACHE = 'vram_footprints.json'
 
+# How many projected hours per model is too many. This was hardcoded at 6,
+# which failed a configuration the user was willing to run: GLM at 9.9 h on a
+# 6 GB card is slow, but it is far better than the multi-day runs this project
+# has already accepted, and a slow run is not an invalid one. The runner has
+# honoured EV_IDS_MAX_HOURS since the circuit breaker was added; the healthcheck
+# was ignoring it and blocking on a number the user had already overridden.
+MAX_HOURS = A._env_num('EV_IDS_MAX_HOURS', 6.0, float)
+
 
 def is_cloud_model(name: str, size_bytes: float = None) -> bool:
     """
@@ -365,8 +373,10 @@ def assess(*, frac, total, ctx, errors, n_run, stated, correct, unrecovered,
     if clamps > n_run:
         env.append(f"{clamps} generation-budget clamps: the prompt is crowding "
                    f"out the answer")
-    if projected_h > 6:
-        env.append(f"projected {projected_h:.1f} h for {n_project} sessions")
+    if projected_h > MAX_HOURS:
+        env.append(f"projected {projected_h:.1f} h for {n_project} sessions "
+                   f"(limit {MAX_HOURS:g} h — raise it with EV_IDS_MAX_HOURS if "
+                   f"you accept the cost)")
 
     answered = n_run - errors
     if answered and unrecovered:
