@@ -578,8 +578,14 @@ def generate_confusion_heatmaps(results_dict, output_dir):
         all_models_data[mn] = [r['model_predictions'].get(mn, {}).get('prediction', 'Normal')
                                 for r in first_llm]
     all_models_data['Majority Vote'] = [r['majority_vote'] for r in first_llm]
+    # Each panel carries its OWN ground truths. A model stopped early by the
+    # circuit breaker has fewer predictions than the first model's ground-truth
+    # list, and pairing them positionally crashed confusion_matrix.
+    panel_gt = {name: ground_truths for name in all_models_data}
     for llm_name, results in results_dict.items():
-        all_models_data[f"{llm_name} Agent (V30)"] = [r['predicted'] for r in results]
+        key = f"{llm_name} Agent (V30)"
+        all_models_data[key] = [r['predicted'] for r in results]
+        panel_gt[key] = [r['ground_truth'] for r in results]
 
     n_models = len(all_models_data)
     cols = 4
@@ -591,15 +597,19 @@ def generate_confusion_heatmaps(results_dict, output_dir):
 
     for idx, (name, preds) in enumerate(all_models_data.items()):
         ax  = axes_flat[idx]
-        y_t = [1 if l == 'Malicious' else 0 for l in ground_truths]
+        gt  = panel_gt.get(name, ground_truths)
+        y_t = [1 if l == 'Malicious' else 0 for l in gt]
         y_p = [1 if l == 'Malicious' else 0 for l in preds]
         cm  = confusion_matrix(y_t, y_p, labels=[0, 1])
         tn = fp = fn = tp = 0
         if cm.shape == (2, 2):
             tn, fp, fn, tp = cm.ravel()
-        acc = (tp + tn) / len(ground_truths) if ground_truths else 0
+        acc = (tp + tn) / len(gt) if gt else 0
         ax.imshow(cm, interpolation='nearest', cmap='Blues', vmin=0, vmax=max(cm.max(), 1))
-        ax.set_title(f'{name}\nAcc={acc:.3f}', fontsize=8, fontweight='bold')
+        # n is shown so a panel built from fewer sessions cannot be read as
+        # comparable to the others at a glance.
+        suffix = f' (n={len(gt)})' if len(gt) != len(ground_truths) else ''
+        ax.set_title(f'{name}{suffix}\nAcc={acc:.3f}', fontsize=8, fontweight='bold')
         ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
         ax.set_xticklabels(['Normal', 'Attack'], fontsize=7)
         ax.set_yticklabels(['Normal', 'Attack'], fontsize=7)
@@ -635,7 +645,42 @@ def print_xai_summary(results_llama):
           f"({xai_mentioned/total_samples*100:.1f}%)")
 
 
+def _ground_truths(results):
+    """Ground truths for exactly the sessions in `results`."""
+    return [r['ground_truth'] for r in results]
+
+
+def _common_indices(*result_sets):
+    """Session indices completed by EVERY model, in their original order."""
+    if not result_sets or not result_sets[0]:
+        return []
+    shared = set.intersection(*[{r['index'] for r in rs} for rs in result_sets])
+    return [r['index'] for r in result_sets[0] if r['index'] in shared]
+
+
+def _restrict(results, indices):
+    """Rows of `results` at `indices`, in the order `indices` gives."""
+    by_idx = {r['index']: r for r in results}
+    return [by_idx[i] for i in indices if i in by_idx]
+
+
 def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir):
+    # A model can finish with FEWER sessions than the others: the circuit
+    # breaker stops a model whose projected cost is implausible, and a
+    # connectivity failure skips one entirely. Every cross-model figure below
+    # used to assume all three had the same sessions in the same order, so a
+    # truncated run crashed in confusion_matrix with "inconsistent numbers of
+    # samples: [200, 5]" and lost the two complete models' results as well.
+    #
+    # Two rules make the comparison correct rather than merely non-crashing:
+    #   1. Each model's OWN accuracy is computed over the sessions IT completed,
+    #      so a complete model's 200 sessions are not discarded.
+    #   2. Anything that COMPARES models -- McNemar, kappa, the zone table --
+    #      is computed on the sessions all three share, because a paired test
+    #      across different sessions is meaningless, not merely imprecise.
+    counts = {'Llama': len(results_llama), 'Qwen': len(results_qwen),
+              'GLM': len(results_glm)}
+    ragged = len(set(counts.values())) > 1
     sample   = results_llama[0]['result'] if results_llama else {}
     rag_on   = sample.get('knowledge_used', False)
     mem_on   = sample.get('memory_used', False)
@@ -657,7 +702,20 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
                  'Gradient Boosting': 'GB'}
     ml_names = list(model_map.keys())
 
-    ground_truths = [r['ground_truth'] for r in results_llama]
+    if ragged:
+        common = _common_indices(results_llama, results_qwen, results_glm)
+        print(f"\n  [INCOMPLETE RUN] The three models did not complete the same "
+              f"number of sessions:")
+        for nm, c in counts.items():
+            print(f"      {nm:<6} {c:>5}")
+        print(f"  Each model's own accuracy below is computed over the sessions IT")
+        print(f"  completed. Paired comparisons (McNemar, kappa) and the zone table")
+        print(f"  use the {len(common)} sessions all three share, since a paired test")
+        print(f"  across different sessions measures nothing. A model with far fewer")
+        print(f"  sessions is not comparable to the others and must not be reported")
+        print(f"  as though it were — re-run it before drawing any conclusion.")
+
+    ground_truths = _ground_truths(results_llama)
     llama_preds   = {n: [r['model_predictions'].get(n, {}).get('prediction', 'Normal')
                           for r in results_llama] for n in ml_names}
     llama_preds['Majority_Vote'] = [r['majority_vote']  for r in results_llama]
@@ -665,10 +723,13 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
     qwen_preds  = {'IDS_Agent': [r['predicted'] for r in results_qwen]}
     glm_preds   = {'IDS_Agent': [r['predicted'] for r in results_glm]}
 
+    # Each model is scored against ITS OWN ground truths.
     llama_m = {m: calculate_metrics(ground_truths, llama_preds[m])
                for m in ml_names + ['Majority_Vote', 'IDS_Agent']}
-    qwen_m  = {'IDS_Agent': calculate_metrics(ground_truths, qwen_preds['IDS_Agent'])}
-    glm_m   = {'IDS_Agent': calculate_metrics(ground_truths, glm_preds['IDS_Agent'])}
+    qwen_m  = {'IDS_Agent': calculate_metrics(_ground_truths(results_qwen),
+                                              qwen_preds['IDS_Agent'])}
+    glm_m   = {'IDS_Agent': calculate_metrics(_ground_truths(results_glm),
+                                              glm_preds['IDS_Agent'])}
 
     # FALLBACK COUNTS (LLM output unparseable -> ML majority used)
     # DECISION PROVENANCE. Reporting only a fallback count hid the fact that a
@@ -736,17 +797,20 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
 
     # CONFUSION MATRIX TABLE
     print(f"\n{'Model':<20} | {'TP':>4} | {'TN':>4} | {'FP':>4} | {'FN':>4} | "
-          f"{'Acc':>6} | {'Prec':>6} | {'Rec':>6} | {'F1':>6} | {'Fallback':>8}")
-    print("-" * 100)
+          f"{'Acc':>6} | {'Prec':>6} | {'Rec':>6} | {'F1':>6} | {'Fallback':>8} | "
+          f"{'n':>5}")
+    print("-" * 110)
     for mn in ml_names:
         m = llama_m[mn]
         print(f"{mn:<20} | {m['tp']:>4} | {m['tn']:>4} | {m['fp']:>4} | {m['fn']:>4} | "
               f"{m['accuracy']:>6.4f} | {m['precision']:>6.4f} | "
-              f"{m['recall']:>6.4f} | {m['f1']:>6.4f} | {'—':>8}")
+              f"{m['recall']:>6.4f} | {m['f1']:>6.4f} | {'—':>8} | "
+              f"{len(results_llama):>5}")
     m = llama_m['Majority_Vote']
     print(f"{'Majority Vote':<20} | {m['tp']:>4} | {m['tn']:>4} | {m['fp']:>4} | {m['fn']:>4} | "
           f"{m['accuracy']:>6.4f} | {m['precision']:>6.4f} | "
-          f"{m['recall']:>6.4f} | {m['f1']:>6.4f} | {'—':>8}")
+          f"{m['recall']:>6.4f} | {m['f1']:>6.4f} | {'—':>8} | "
+          f"{len(results_llama):>5}")
     for llm_name, metrics, results in [
             ('Llama Agent V30', llama_m['IDS_Agent'], results_llama),
             ('Qwen Agent V30',  qwen_m['IDS_Agent'],  results_qwen),
@@ -755,7 +819,8 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
         n_fb = sum(1 for r in results if r['result'].get('used_fallback'))
         print(f"{llm_name:<20} | {m['tp']:>4} | {m['tn']:>4} | {m['fp']:>4} | {m['fn']:>4} | "
               f"{m['accuracy']:>6.4f} | {m['precision']:>6.4f} | "
-              f"{m['recall']:>6.4f} | {m['f1']:>6.4f} | {n_fb:>8}")
+              f"{m['recall']:>6.4f} | {m['f1']:>6.4f} | {n_fb:>8} | "
+              f"{len(results):>5}")
 
     # HEATMAPS
     print(f"\n{'='*120}")
@@ -835,16 +900,27 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
         print(f"  {z:<20}: {data['total']} ({n_mal}M, {data['total']-n_mal}N)")
     print(f"\n  {'Zone':<20} | {'Llama':>8} | {'Qwen':>8} | {'GLM':>8} | {'Majority':>8} | {'Best ML':>8}")
     print(f"  {'-'*80}")
+    # The zone table compares the three models, so it is restricted to sessions
+    # all three completed. Positional indexing into a shorter model's list was
+    # the second way a truncated run went wrong: it silently compared Qwen's
+    # session 3 against Llama's session 3 by POSITION, not by session id.
+    shared_idx = _common_indices(results_llama, results_qwen, results_glm)
+    zone_rows  = _restrict(results_llama, shared_idx)
+    if ragged:
+        print(f"  (restricted to the {len(shared_idx)} sessions all three models "
+              f"completed)")
     for zone in sorted(zones.keys()):
-        zone_idx = [i for i, r in enumerate(results_llama)
+        zone_ids = [r['index'] for r in zone_rows
                     if r['result'].get('difficulty_zone') == zone]
-        if not zone_idx:
+        if not zone_ids:
             continue
-        zone_gt  = [ground_truths[i] for i in zone_idx]
+        zone_gt  = _ground_truths(_restrict(results_llama, zone_ids))
         zone_accs = {}
         for lname, results in [('Llama', results_llama), ('Qwen', results_qwen), ('GLM', results_glm)]:
-            zp = [results[i]['predicted'] for i in zone_idx]
+            zp = [r['predicted'] for r in _restrict(results, zone_ids)]
             zone_accs[lname] = sum(a == b for a, b in zip(zone_gt, zp)) / len(zone_gt)
+        pos = {r['index']: i for i, r in enumerate(results_llama)}
+        zone_idx  = [pos[i] for i in zone_ids]
         maj_preds = [llama_preds['Majority_Vote'][i] for i in zone_idx]
         zone_accs['Majority'] = sum(a == b for a, b in zip(zone_gt, maj_preds)) / len(zone_gt)
         zone_accs['Best ML']  = max(
@@ -906,12 +982,23 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
     for (na, ra), (nb, rb) in [(llm_sets[0], llm_sets[1]),
                                (llm_sets[0], llm_sets[2]),
                                (llm_sets[1], llm_sets[2])]:
-        ca = [r['correct'] for r in ra]
-        cb = [r['correct'] for r in rb]
-        mc = mcnemar_test(ca, cb)
-        kp = cohens_kappa([r['predicted'] for r in ra], [r['predicted'] for r in rb])
+        # McNemar and kappa are PAIRED: each pair must be the same session
+        # judged by both models. Zipping two lists of different lengths silently
+        # pairs unrelated sessions and still prints a p-value, which is worse
+        # than crashing.
+        pair_idx = _common_indices(ra, rb)
+        ra_c, rb_c = _restrict(ra, pair_idx), _restrict(rb, pair_idx)
+        if not pair_idx:
+            print(f"  {na+' vs '+nb:<18} |   - |   - |         - |       - |      -"
+                  f"   (no shared sessions)")
+            continue
+        mc = mcnemar_test([r['correct'] for r in ra_c],
+                          [r['correct'] for r in rb_c])
+        kp = cohens_kappa([r['predicted'] for r in ra_c],
+                          [r['predicted'] for r in rb_c])
+        note = f"   n={len(pair_idx)}" if ragged else ""
         print(f"  {na+' vs '+nb:<18} | {mc['b']:>3} | {mc['c']:>3} | "
-              f"{mc['p_value']:>9.4f} | {str(mc['significant']):>7} | {kp:>6.3f}")
+              f"{mc['p_value']:>9.4f} | {str(mc['significant']):>7} | {kp:>6.3f}{note}")
 
     # Transport integrity — a validity precondition, printed before anything
     # that could be mistaken for a property of the models.

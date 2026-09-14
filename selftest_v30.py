@@ -386,6 +386,84 @@ def main():
         check("the parallel path cancels queued work when it trips",
               'cancel' in parallel, True)
         check("llm errors are counted in progress", 'llm_error' in src, True)
+
+        # RAGGED RESULTS. The circuit breaker can stop one model early, so the
+        # three result sets need not be the same length. Every cross-model
+        # figure used to assume they were, and a run with 200 Llama sessions
+        # and 5 Qwen crashed in confusion_matrix with "inconsistent numbers of
+        # samples: [200, 5]" -- losing the two COMPLETE models' results too.
+        import io, contextlib
+        ML = ['Random Forest', 'K-Nearest Neighbors', 'Logistic Regression',
+              'MLP', 'Support Vector Classifier', 'Decision Tree',
+              'Gradient Boosting']
+
+        def _row(i, truth, pred):
+            return {'index': i, 'ground_truth': truth, 'predicted': pred,
+                    'correct': truth == pred, 'majority_vote': 'Normal',
+                    'model_predictions': {m: {'prediction': 'Normal',
+                                              'confidence': 0.6} for m in ML},
+                    'result': {'predicted_label': pred, 'confidence': 0.7,
+                               'llm_confidence': 'high', 'used_fallback': False,
+                               'llm_parsed': True, 'llm_error': False,
+                               'verdict_source': 'stated',
+                               'difficulty_zone': 'EASY_ATTACK' if truth == 'Malicious'
+                                                  else 'EASY_NORMAL',
+                               'delivery_ratio': 1.8 if truth == 'Malicious' else 1.0,
+                               'xai_top_feature': 'kWhDelivered',
+                               'llm_xai_assessment': 'kWhDelivered drives it',
+                               'llm_reasoning': 'delivered', 'llm_analysis': 'ratio',
+                               'knowledge_used': True, 'memory_used': True,
+                               'xai_enabled': True, 'ltm_cases_referenced': 2,
+                               'rag_sources_used': 2,
+                               'complexity': {'llm_latency_sec': 10.0,
+                                              'stage1_latency': 6.0,
+                                              'stage2_latency': 4.0, 'xai_sec': 1.0,
+                                              'prompt_chars': 9000,
+                                              'response_words': 400,
+                                              'tokens_per_sec': 2.0,
+                                              'session_total_sec': 12.0}}}
+
+        truths = ['Malicious' if i % 3 == 0 else 'Normal' for i in range(40)]
+        full_a = [_row(i, truths[i], truths[i] if i % 11 else 'Normal')
+                  for i in range(40)]
+        full_c = [_row(i, truths[i], truths[i] if i % 7 else 'Normal')
+                  for i in range(40)]
+        short  = [_row(i, truths[i], truths[i]) for i in range(5)]
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    R.print_triple_comparison(full_a, short, full_c, td)
+                ok, err = True, ''
+            except Exception as exc:
+                ok, err = False, f"{type(exc).__name__}: {exc}"
+            out = buf.getvalue()
+            check(f"a truncated model does not crash the comparison{' — ' + err if err else ''}",
+                  ok, True)
+            if ok:
+                check("the incomplete run is announced",
+                      'INCOMPLETE RUN' in out, True)
+                check("each model keeps its own n",
+                      '5' in out and '40' in out, True)
+                check("paired tests report the shared n",
+                      'n=5' in out, True)
+
+            # And the equal-length path must be untouched.
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                R.print_triple_comparison(full_a, list(full_c), full_c, td)
+            out2 = buf2.getvalue()
+            check("a complete run shows no incomplete banner",
+                  'INCOMPLETE RUN' in out2, False)
+            check("a complete run shows no restriction note",
+                  'restricted to' in out2, False)
+
+        check("_common_indices intersects by session id",
+              R._common_indices(full_a, short), [0, 1, 2, 3, 4])
+        check("_restrict follows the requested order",
+              [r['index'] for r in R._restrict(full_a, [3, 1])], [3, 1])
     except Exception as e:
         FAIL.append(f"runner import failed: {e}")
 
