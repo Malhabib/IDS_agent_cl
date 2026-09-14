@@ -373,10 +373,16 @@ def assess(*, frac, total, ctx, errors, n_run, stated, correct, unrecovered,
     if clamps > n_run:
         env.append(f"{clamps} generation-budget clamps: the prompt is crowding "
                    f"out the answer")
+    # Duration is a COST, not a fault. A model that answers every probe
+    # correctly with no errors is usable however long it takes; sample size and
+    # patience are the researcher's decisions. Failing a healthy model for being
+    # slow is what stopped a clean Qwen run at session 5 of 200. Reported as a
+    # caveat so the cost is known in advance.
     if projected_h > MAX_HOURS:
-        env.append(f"projected {projected_h:.1f} h for {n_project} sessions "
-                   f"(limit {MAX_HOURS:g} h — raise it with EV_IDS_MAX_HOURS if "
-                   f"you accept the cost)")
+        caveat.append(f"projected {projected_h:.1f} h for {n_project} sessions, "
+                      f"above the {MAX_HOURS:g} h notice threshold. This is a "
+                      f"cost, not a fault — budget for it or reduce the sample "
+                      f"size.")
 
     answered = n_run - errors
     if answered and unrecovered:

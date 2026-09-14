@@ -338,10 +338,15 @@ def main():
                                projected_h=16.5)
         check("timeouts still FAIL", v, 'FAIL')
 
-        v, _, behav, _ = verdict(frac=0.22, stated=0, correct=0, unrecovered=6,
-                                 projected_h=11.3)
-        check("no verdict after repair FAILs on projected hours", v, 'FAIL')
-        check("...and records the behaviour", len(behav) >= 1, True)
+        # 0 errors, full context, clean transport, but no verdict survives the
+        # repair: that is the MODEL's behaviour, not a broken environment, so it
+        # is WEAK rather than FAIL. The run is worth doing and reporting as a
+        # documented negative result.
+        v, env, behav, _ = verdict(frac=0.22, stated=0, correct=0, unrecovered=6,
+                                   projected_h=11.3)
+        check("silent model with a clean environment is WEAK, not FAIL", v, 'WEAK')
+        check("...and no environment failure is claimed", env, [])
+        check("...and the behaviour is recorded", len(behav) >= 1, True)
 
         v, env, _, cav = verdict(frac=None, total=0, cloud=True)
         check("a cloud model gets no residency caveat", cav, [])
@@ -349,6 +354,19 @@ def main():
 
         v, env, _, _ = verdict(ctx=4096)
         check("a short-granted window still FAILs", v, 'FAIL')
+
+        # A SLOW run is not a BROKEN run. A clean Qwen run -- 5/5 correct, no
+        # fallbacks, no errors, no timeouts, no clamps, full 8192 context -- was
+        # killed at session 5 of 200 for projecting 12 h against an 8 h limit.
+        # Sample size is the researcher's decision; only an unusable run is
+        # worth abandoning.
+        v, env, _, cav = verdict(projected_h=30.0, n_project=200)
+        check("a healthy but slow model is a GO", v, 'GO')
+        check("...with no environment failure", env, [])
+        check("...and the cost reported as a caveat",
+              any('cost, not a fault' in x for x in cav), True)
+        v, env, _, _ = verdict(projected_h=30.0, errors=3, n_run=6)
+        check("slow AND failing still FAILs", v, 'FAIL')
         check("both 1.5 probes agree", tally(1.5) == tally(22.80 / 15.20), True)
         check("SHAP points toward Attack on an attack", dlv_shap(1.78) > 0.1, True)
         check("SHAP is near zero on a normal", abs(dlv_shap(1.004)) < 0.01, True)
@@ -383,6 +401,17 @@ def main():
               '_breaker()' in serial, True)
         check("circuit breaker guards the PARALLEL path",
               '_breaker()' in parallel, True)
+        # The breaker must ABORT only on unanswered calls. Aborting on duration
+        # discarded a clean 200-session Qwen run at session 5.
+        breaker = src[src.index('def _breaker'):src.index('if workers <= 1')]
+        abort_lines = [l for l in breaker.splitlines()
+                       if l.strip().startswith('return (')]
+        check("the breaker's only abort condition is the error rate",
+              len(abort_lines), 1)
+        check("duration warns instead of aborting",
+              'NOT STOPPING' in breaker, True)
+        check("the error-rate abort is still present",
+              'n_error / done > BREAKER_MAX_ERROR_RATE' in breaker, True)
         check("the parallel path cancels queued work when it trips",
               'cancel' in parallel, True)
         check("llm errors are counted in progress", 'llm_error' in src, True)

@@ -72,9 +72,11 @@ PRINT_LOCK = threading.Lock()
 # run_classification._breaker(). These are deliberately generous: they do not
 # stop a slow run, they stop a broken one.
 BREAKER_MIN_SESSIONS   = 5      # never judge on fewer than this
-BREAKER_MAX_ERROR_RATE = 0.20   # >20% of sessions with no LLM answer
-# Projected wall-clock for one model before the breaker trips. Raise it to
-# accept a deliberately slow configuration:  set EV_IDS_MAX_HOURS=24
+BREAKER_MAX_ERROR_RATE = 0.20   # >20% of sessions with no LLM answer -> ABORT
+# Projected wall-clock after which the run says how long it will take. This is
+# a NOTICE, not a limit: it never stops a run. Sample size is the researcher's
+# decision and a slow result is still a result.
+#   set EV_IDS_MAX_HOURS=24     to move the notice
 BREAKER_MAX_HOURS      = _env_num('EV_IDS_MAX_HOURS', 8.0, float)
 
 
@@ -458,29 +460,46 @@ def run_classification(agent, emoji, label, selected, df, workers=1):
                   f"truth={row['ground_truth']:<9} pred={row['predicted']:<9} "
                   f"[{sym}]{fb}{er}  elapsed={elapsed/60:.1f}m ETA={eta/60:.1f}m")
 
+    warned_slow = [False]
+
     def _breaker():
         """
-        Stop a run that is already known to be unusable.
+        Stop a run that is BROKEN. Never stop one that is merely slow.
 
-        Two things make a run worthless no matter how long it continues: calls
-        that do not complete, and a projected duration nobody will wait for.
-        Both are visible within the first handful of sessions. Detecting them at
-        session 5 instead of session 50 is the difference between losing four
-        minutes and losing two days -- which is precisely what happened to the
-        V29.1 and V29.2 runs.
+        The original version also aborted on projected duration, and that was
+        wrong. It killed a Qwen run at session 5 of 200 that was reporting 5/5
+        correct, zero fallbacks, zero LLM errors, zero timeouts, zero budget
+        clamps and the full 8192-token context -- a perfectly healthy run,
+        discarded for taking 12 h instead of 8. Sample size is the researcher's
+        decision, and a slow result is still a result; only an unusable one is
+        worth abandoning.
+
+        Duration is therefore reported once, as a warning, with the measured
+        rate so the cost is an informed choice rather than a surprise. Ctrl-C
+        remains available, and the partial results are still written.
         """
         if done < BREAKER_MIN_SESSIONS:
             return None
+
+        rate = (time.time() - t_start) / done
+        projected_h = rate * total / 3600.0
+        if projected_h > BREAKER_MAX_HOURS and not warned_slow[0]:
+            warned_slow[0] = True
+            with PRINT_LOCK:
+                print(f"\n  [SLOW — NOT STOPPING] {label} measures {rate:.0f}s per "
+                      f"session, so {total}\n    sessions will take about "
+                      f"{projected_h:.1f} h. Every health signal is clean, so this "
+                      f"is a\n    cost, not a fault. Press Ctrl-C now if that is "
+                      f"longer than you want;\n    partial results are still "
+                      f"written. Set EV_IDS_MAX_HOURS to move this notice.")
+
+        # The only abort condition: the model is not answering. Those sessions
+        # are labelled by the ML majority and scored as if the model had spoken,
+        # so continuing produces numbers that describe the GPU, not the model.
         if n_error / done > BREAKER_MAX_ERROR_RATE:
             return (f"{n_error} of the first {done} sessions were LLM errors "
                     f"({n_error/done*100:.0f}%). The transport is failing; the "
                     f"remaining {total-done} sessions would fail the same way.")
-        projected_h = (time.time() - t_start) / done * total / 3600.0
-        if projected_h > BREAKER_MAX_HOURS:
-            return (f"measured {(time.time()-t_start)/done:.0f}s per session, so "
-                    f"{total} sessions project to {projected_h:.1f} h "
-                    f"(limit {BREAKER_MAX_HOURS} h). Almost always this means the "
-                    f"model is not fully resident in VRAM.")
         return None
 
     if workers <= 1:
