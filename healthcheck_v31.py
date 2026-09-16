@@ -1,6 +1,6 @@
-# healthcheck_v30.py
+# healthcheck_v31.py
 """
-Decide in MINUTES whether a V30 study is worth starting. Needs Ollama; does not
+Decide in MINUTES whether a V31 study is worth starting. Needs Ollama; does not
 need the dataset or the trained classifiers.
 
 The problem it solves
@@ -25,17 +25,17 @@ is "eleven hours per session", you learn it now rather than on Thursday.
 
 Usage
 -----
-    python healthcheck_v30.py                 # 50 sessions, default models
-    python healthcheck_v30.py --n 100         # project the cost for 100
-    python healthcheck_v30.py --models glm4:latest
-    python healthcheck_v30.py --timeout 120   # stricter per-call deadline
+    python healthcheck_v31.py                 # 50 sessions, default models
+    python healthcheck_v31.py --n 100         # project the cost for 100
+    python healthcheck_v31.py --models glm4:latest
+    python healthcheck_v31.py --timeout 120   # stricter per-call deadline
 
 Exit code 0 = GO. Anything else = do not start the study.
 """
 
 import argparse, json, sys, time
 
-import ev_ids_agent_v6_triple_llm_v30 as A
+import ev_ids_agent_v6_triple_llm_v31 as A
 
 # The study's TARGET models. The healthcheck's job is to report whether this
 # machine can measure them -- not to quietly propose easier ones. Results from
@@ -57,8 +57,8 @@ PROBES = [
 # Use the framework's OWN system prompt and Stage 2 question, not an
 # approximation of them. Both are what the study will actually send, and their
 # length is part of what the healthcheck is measuring.
-SYSTEM = A.EVIDSAgentV6TripleLLMV30._get_system_prompt(None)
-STAGE2_QUESTION = A.EVIDSAgentV6TripleLLMV30.STAGE2_USER
+SYSTEM = A.EVIDSAgentV6TripleLLMV31._get_system_prompt(None)
+STAGE2_QUESTION = A.EVIDSAgentV6TripleLLMV31.STAGE2_USER
 
 
 def evidence_for(ratio: float) -> str:
@@ -469,7 +469,7 @@ def check_model(model, base_url, n_project, timeout):
                              f"delivered {dlv:.3f} kWh "
                              f"(delivered/requested = {dlv/req:.3f}).\n\n"
                              f"Answer with ONE word only — Attack or Normal:"),
-                temperature=0.0, max_tokens=A.EVIDSAgentV6TripleLLMV30
+                temperature=0.0, max_tokens=A.EVIDSAgentV6TripleLLMV31
                                             ._repair_budget(None),
                 force_no_think=True)
             if rep and not rep.startswith(A.LLM_ERROR_PREFIX):
@@ -644,7 +644,7 @@ def main():
 
     sample = probe_prompt(12.0, 18.0)
     print(f"\n{A.config_banner(tuple(args.models))}")
-    print(f"\n  V30 HEALTHCHECK")
+    print(f"\n  V31 HEALTHCHECK")
     print(f"  {len(PROBES)} unambiguous probe sessions per model, full two-stage "
           f"pipeline.")
     print(f"  Prompts are the framework's own: system {len(SYSTEM)} chars, "
@@ -672,9 +672,9 @@ def main():
               f"the granted\n    context may vary between runs — report the "
               f"residency with the results.")
 
-    with open('healthcheck_v30.json', 'w') as f:
+    with open('healthcheck_v31.json', 'w') as f:
         json.dump(rows, f, indent=2)
-    print(f"\n  Written: healthcheck_v30.json")
+    print(f"\n  Written: healthcheck_v31.json")
 
     broken = [r for r in rows if r['verdict'] == 'FAIL']
     weak   = [r for r in rows if r['verdict'] == 'WEAK']
@@ -777,7 +777,7 @@ def suggest_fitting_models(broken_models, base_url):
 
     if fits_now:
         print(f"\n  Usable right now at num_ctx {A.NUM_CTX}: {', '.join(fits_now)}")
-    print(f"  Re-check one with:  python healthcheck_v30.py --models <name> --n 50")
+    print(f"  Re-check one with:  python healthcheck_v31.py --models <name> --n 50")
 
     # A model whose WEIGHTS exceed the card cannot be rescued by any window
     # setting, so say so rather than leaving --num-ctx as an implied remedy.

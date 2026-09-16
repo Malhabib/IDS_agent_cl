@@ -1,4 +1,4 @@
-# llm_eval_metrics_v30.py
+# llm_eval_metrics_v31.py
 """
 LLM evaluation metrics for the EV-IDS-Agent study.
 
@@ -272,7 +272,7 @@ def aggregate_runs(result_files: List[str]) -> str:
     expect. It also removes the awkwardness of publishing an unqualified 1.00.
 
     Usage:
-        python llm_eval_metrics_v30.py results/run_seed42.json results/run_seed7.json ...
+        python llm_eval_metrics_v31.py results/run_seed42.json results/run_seed7.json ...
     """
     import json, statistics
     per_llm = {'llama': [], 'qwen': [], 'glm': []}
@@ -337,8 +337,8 @@ if __name__ == "__main__":
     if not args:
         print(__doc__)
         print("Aggregate several runs (wildcards are expanded internally):")
-        print("  python llm_eval_metrics_v30.py results/triple_llm_v6_v30_*.json")
-        print("  python llm_eval_metrics_v30.py runA.json runB.json runC.json")
+        print("  python llm_eval_metrics_v31.py results/triple_llm_v6_v31_*.json")
+        print("  python llm_eval_metrics_v31.py runA.json runB.json runC.json")
     else:
         print(f"  Aggregating {len(args)} file(s):")
         for a in args:

@@ -1,6 +1,6 @@
-# ev_ids_agent_v6_triple_llm_v30.py
+# ev_ids_agent_v6_triple_llm_v31.py
 """
-EV-IDS-Agent VERSION 6 - TRIPLE LLM V30
+EV-IDS-Agent VERSION 6 - TRIPLE LLM V31
 
 HEADLINE CHANGE IN V30 — GLM, AND THE END OF UNMEASURABLE RUNS
   GLM's poor and unstable scores were not a prompt problem, a parsing problem
@@ -35,9 +35,9 @@ HEADLINE CHANGE IN V30 — GLM, AND THE END OF UNMEASURABLE RUNS
 
   Supporting these, V30 adds three gates that run BEFORE a study, so a broken
   environment costs minutes instead of two days:
-     selftest_v30.py         seconds  no GPU   decision-path assertions
-     integration_test_v30.py ~1 min   no GPU   full pipeline on synthetic data
-     healthcheck_v30.py      minutes  GPU      per-model cost and verdict rate
+     selftest_v31.py         seconds  no GPU   decision-path assertions
+     integration_test_v31.py ~1 min   no GPU   full pipeline on synthetic data
+     healthcheck_v31.py      minutes  GPU      per-model cost and verdict rate
   and a circuit breaker inside the run itself, which stops after five sessions
   if calls are failing or the projected wall-clock is implausible.
 
@@ -96,7 +96,7 @@ FIX HISTORY FOLDED INTO THIS VERSION
       discarded when they are retrained, so stale SHAP/LIME can never be fed
       into the prompt.
 
-REQUIRES (same folder): simple_run_v6_triple_llm_v28.py, llm_eval_metrics_v30.py
+REQUIRES (same folder): simple_run_v6_triple_llm_v28.py, llm_eval_metrics_v31.py
     pip install shap lime ollama requests scikit-learn pandas numpy
 """
 
@@ -1230,8 +1230,24 @@ def build_xai_store(config: dict, df: pd.DataFrame, column_mapping: dict,
         print(f"\n  [XAI] Initialising shared SHAP + LIME explainers "
               f"({len(bg_scaled)} background samples)...")
         explainer  = XAIExplainer(models, bg_scaled, FEATURE_NAMES, n_kernel_bg=30)
-        cache_path = os.path.join(
-            config.get('workspace_dir', './ev_ids_workspace_v6'), 'xai_cache_v30.pkl')
+        # Version-NEUTRAL cache name, with a one-time migration from the V30
+        # file. The cache is validated by a fingerprint of the trained models,
+        # not by the framework version, so a cache written under V30 is still
+        # correct under V31 and stays correct until the classifiers are
+        # retrained. Bumping the filename every release would silently discard a
+        # valid cache and pay for a full SHAP recompute -- minutes of
+        # KernelExplainer work on MLP, SVC and KNN -- for no benefit at all.
+        workspace  = config.get('workspace_dir', './ev_ids_workspace_v6')
+        cache_path = os.path.join(workspace, 'xai_cache.pkl')
+        legacy     = os.path.join(workspace, 'xai_cache_v30.pkl')
+        if not os.path.exists(cache_path) and os.path.exists(legacy):
+            try:
+                os.replace(legacy, cache_path)
+                print(f"  [XAI] Reusing the V30 cache (renamed to xai_cache.pkl); "
+                      f"its fingerprint is still checked below.")
+            except Exception as e:
+                print(f"  [XAI] Could not reuse the V30 cache ({e}); "
+                      f"recomputing from scratch.")
         fp = XAIStore.models_fingerprint(config['models_dir'])
         print(f"  [XAI] Model fingerprint: {fp}")
         return XAIStore(explainer, cache_path, fingerprint=fp)
@@ -1457,7 +1473,7 @@ class LongTermMemory:
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN AGENT — V25 (V23 flow and prompts, performance-fixed)
 # ══════════════════════════════════════════════════════════════════════════════
-class EVIDSAgentV6TripleLLMV30:
+class EVIDSAgentV6TripleLLMV31:
     """
     Same idea, objective, 7-step flow and prompts as V23.
     V25 differences are implementation-only:
@@ -1976,10 +1992,10 @@ Provide your structured analysis using the format in your instructions."""
             "ltm_cases_referenced": len(ltm_cases),
             "rag_sources_used":     len(rag_sources),
             "classifier_votes":     dict(votes),
-            "aggregation_method":   ("V30_RAG_LTM_XAI" if (self.use_knowledge and self.use_memory)
-                                     else "V30_RAG_XAI"  if self.use_knowledge
-                                     else "V30_LTM_XAI"  if self.use_memory
-                                     else "V30_ML_XAI"),
+            "aggregation_method":   ("V31_RAG_LTM_XAI" if (self.use_knowledge and self.use_memory)
+                                     else "V31_RAG_XAI"  if self.use_knowledge
+                                     else "V31_LTM_XAI"  if self.use_memory
+                                     else "V31_ML_XAI"),
             "complexity":           complexity_metrics
         }
 

@@ -1,11 +1,11 @@
-# integration_test_v30.py
+# integration_test_v31.py
 """
-End-to-end test of the V30 seven-step pipeline. Synthetic data, real
+End-to-end test of the V31 seven-step pipeline. Synthetic data, real
 classifiers, real SHAP, scripted model. No GPU, no Ollama, no real dataset.
 
 Why this exists
 ---------------
-selftest_v30.py checks the decision path in isolation. It cannot catch a bug in
+selftest_v31.py checks the decision path in isolation. It cannot catch a bug in
 how the steps are wired together -- and that is the class of bug that has cost
 this project whole runs:
 
@@ -19,7 +19,7 @@ this project whole runs:
 This script runs detect() for real, over every step, and asserts on what comes
 out. It takes about a minute.
 
-    python integration_test_v30.py
+    python integration_test_v31.py
 
 Exit 0 = the pipeline is wired correctly end to end.
 """
@@ -28,7 +28,7 @@ import os, shutil, sys, tempfile
 import numpy as np
 import pandas as pd
 
-import ev_ids_agent_v6_triple_llm_v30 as A
+import ev_ids_agent_v6_triple_llm_v31 as A
 
 RESULTS = []
 
@@ -123,12 +123,12 @@ def build_agent(workspace, data_path, client, **kw):
         'knowledge_base_path': os.path.join(workspace, 'knowledge_base'),
         'workspace_dir':       workspace,
     }
-    return A.EVIDSAgentV6TripleLLMV30(
+    return A.EVIDSAgentV6TripleLLMV31(
         config, client, scenario_tag='integration', verbose=False, **kw)
 
 
 def main():
-    ws = tempfile.mkdtemp(prefix='ev_ids_v30_it_')
+    ws = tempfile.mkdtemp(prefix='ev_ids_v31_it_')
     try:
         data_path = make_dataset(os.path.join(ws, 'synthetic.csv'))
         models_dir = os.path.join(ws, 'models')
@@ -228,7 +228,7 @@ def main():
               len(p4) < len(stage1_prompt), True)
 
         # ── metrics module on a mixed result set ─────────────────────────────
-        import llm_eval_metrics_v30 as M
+        import llm_eval_metrics_v31 as M
         rows = [{'correct': True,  'result': r},
                 {'correct': False, 'result': r2},
                 {'correct': True,  'result': r3}]
@@ -248,7 +248,7 @@ def main():
         shutil.rmtree(ws, ignore_errors=True)
 
     failed = [x for x in RESULTS if not x[1]]
-    print(f"\n  V30 INTEGRATION TEST")
+    print(f"\n  V31 INTEGRATION TEST")
     print(f"  {'-'*66}")
     print(f"  passed : {len(RESULTS) - len(failed)}")
     print(f"  failed : {len(failed)}")

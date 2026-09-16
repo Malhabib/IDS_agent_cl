@@ -1,9 +1,60 @@
-# EV-IDS-Agent V6 — Triple LLM, V30
+# EV-IDS-Agent V6 — Triple LLM, V31
 
 Pipeline, prompts, the seven-step detection flow, the A/B/C/D scenarios and the
 V23-style per-session explainability output are **unchanged**. Everything below
 is a fix to how the framework talks to the models and to how it reports what
 happened.
+
+---
+
+## 0. What changed in V31
+
+V31 is V30 with three defects fixed, all of them found by running it on real
+hardware rather than by reading it. The pipeline, prompts, seven-step flow,
+scenarios and per-session explainability output are unchanged.
+
+### 0.1 A truncated model no longer destroys the whole comparison
+
+A 200-sample run stopped Qwen at session 5 and then died:
+
+```
+ValueError: Found input variables with inconsistent numbers of samples: [200, 5]
+```
+
+Llama and GLM had both completed all 200 sessions and their results were lost
+with it, after about an hour of GPU time. Every cross-model figure assumed the
+three result sets were the same length **and in the same order**. Two rules now
+apply: each model's own accuracy is computed over the sessions *it* completed,
+and anything that *compares* models uses only the sessions all three share.
+
+The second rule matters more than the crash. McNemar and Cohen's kappa are
+paired tests — zipping lists of different lengths pairs unrelated sessions and
+still prints a p-value. The zone table had the same defect through positional
+indexing: it compared one model's third row against another's third row by
+*position* rather than by session id. Silently wrong is worse than loudly broken.
+
+### 0.2 The circuit breaker no longer aborts a healthy run for being slow
+
+Qwen was stopped at session 5 of 200 while reporting 5/5 correct, zero
+fallbacks, zero LLM errors, zero timeouts, zero budget clamps and the full
+8192-token context. Not one health signal was bad. It was killed for projecting
+12.0 h against an 8 h limit — while the comment above it read *"It does not stop
+a slow run, it stops a broken one."*
+
+The breaker's only abort condition is now the LLM error rate, which is the one
+case where continuing produces numbers describing the GPU rather than the model.
+Projected duration prints a single notice with the measured per-session rate and
+lets the run continue. Sample size and patience are the researcher's decisions;
+a slow result is still a result. `healthcheck` likewise reports duration as a
+cost, not a fault.
+
+### 0.3 The XAI cache survives a version bump
+
+The cache is validated by a fingerprint of the trained models, not by the
+framework version, so it is now named `xai_cache.pkl` rather than carrying a
+version number. An existing `xai_cache_v30.pkl` is migrated on first run. Bumping
+the name every release would silently discard a valid cache and pay for a full
+SHAP recompute — minutes of KernelExplainer work — for no benefit.
 
 ---
 
@@ -141,7 +192,7 @@ make the outputs wrong — CPU inference is still inference — but it is the di
 source of the multi-day runtime, and it means Qwen was never measured under the
 same conditions as the other two models.
 
-The advisor in `healthcheck_v30.py` now distinguishes weights from loaded
+The advisor in `healthcheck_v31.py` now distinguishes weights from loaded
 footprint and states which models fit at 8192, which fit only at 4096, and which
 cannot fit at all.
 
@@ -161,7 +212,7 @@ Where a target does not fit, the levers are, in order:
 1. **Free VRAM.** Desktop applications held 1.7–7.7 GB on the test machine.
 2. **Lower `num_ctx`.** The KV cache scales with the window, so this changes
    the VRAM a model needs *without changing the model*.
-   `set EV_IDS_NUM_CTX=6144`, or `healthcheck_v30.py --num-ctx 6144`.
+   `set EV_IDS_NUM_CTX=6144`, or `healthcheck_v31.py --num-ctx 6144`.
 3. **A larger GPU.** `glm-4.7-flash` is 19 GB and needs a 24 GB card.
 
 `num_ctx` has a hard floor, computed by `min_viable_num_ctx()` from the actual
@@ -182,9 +233,9 @@ Run them in order. Each must exit 0 before the next is worth running.
 
 | gate | time | needs | catches |
 |---|---|---|---|
-| `python selftest_v30.py` | seconds | nothing | verdict/section parsing, provenance, budget arithmetic, SHAP sign, renamed-symbol `NameError`s |
-| `python integration_test_v30.py` | ~1 min | nothing | the seven steps wired together: real classifiers, real SHAP, scripted model, 41 assertions |
-| `python healthcheck_v30.py --n 50` | minutes | Ollama | VRAM residency, the context actually granted, verdict rate, error rate, and the **projected total hours** |
+| `python selftest_v31.py` | seconds | nothing | verdict/section parsing, provenance, budget arithmetic, SHAP sign, renamed-symbol `NameError`s |
+| `python integration_test_v31.py` | ~1 min | nothing | the seven steps wired together: real classifiers, real SHAP, scripted model, 41 assertions |
+| `python healthcheck_v31.py --n 50` | minutes | Ollama | VRAM residency, the context actually granted, verdict rate, error rate, and the **projected total hours** |
 
 Neither of the first two needs Ollama, a GPU, or your dataset — the integration
 test generates synthetic sessions and trains the seven classifiers on them.
@@ -227,7 +278,7 @@ instruction asked for a prediction, contradicting the framework's own system
 prompt, which reserves the verdict for Stage 2.
 
 Every block now tracks the session, the repair call is included, and
-`selftest_v30.py` asserts all of it — 75 assertions — so it cannot regress.
+`selftest_v31.py` asserts all of it — 75 assertions — so it cannot regress.
 Raw Stage 1, Stage 2 and repair responses are written to
 `healthcheck_transcript_<model>.txt` on every run, because diagnosing "no
 verdict stated" from a counter alone is guesswork.

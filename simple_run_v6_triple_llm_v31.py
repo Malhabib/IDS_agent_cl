@@ -1,24 +1,24 @@
-# simple_run_v6_triple_llm_v30.py
+# simple_run_v6_triple_llm_v31.py
 """
-EV-IDS-Agent VERSION 6 - TRIPLE LLM V30 Runner  (final consolidated version)
+EV-IDS-Agent VERSION 6 - TRIPLE LLM V31 Runner
 
 Pipeline, prompts, 7-step flow, scenarios (A/B/C/D) and the V23-style
-explainability output are UNCHANGED. V30 is V23 plus accumulated fixes.
+explainability output are UNCHANGED. V31 is V23 plus accumulated fixes.
 
 RUN REQUIREMENTS
     All files must sit in the SAME folder:
-        ev_ids_agent_v6_triple_llm_v30.py
-        simple_run_v6_triple_llm_v30.py
-        llm_eval_metrics_v30.py
-        selftest_v30.py  integration_test_v30.py  healthcheck_v30.py
+        ev_ids_agent_v6_triple_llm_v31.py
+        simple_run_v6_triple_llm_v31.py
+        llm_eval_metrics_v31.py
+        selftest_v31.py  integration_test_v31.py  healthcheck_v31.py
     pip install shap lime ollama requests scikit-learn pandas numpy matplotlib
     Edit DATA_PATH in main() to point at your CSV.
 
 RUN THE GATES FIRST — IN THIS ORDER
-    python selftest_v30.py           seconds, no GPU
-    python integration_test_v30.py   ~1 minute, no GPU
-    python healthcheck_v30.py --n 50 minutes, needs Ollama
-    python simple_run_v6_triple_llm_v30.py
+    python selftest_v31.py           seconds, no GPU
+    python integration_test_v31.py   ~1 minute, no GPU
+    python healthcheck_v31.py --n 50 minutes, needs Ollama
+    python simple_run_v6_triple_llm_v31.py
 
   Each gate must exit 0 before the next is worth running. The first two need
   neither Ollama nor your dataset; the third measures the real per-session cost
@@ -52,13 +52,13 @@ import numpy as np
 from datetime import datetime
 from collections import Counter
 from sklearn.metrics import confusion_matrix
-from llm_eval_metrics_v30 import (
+from llm_eval_metrics_v31 import (
     wilson_ci, mcnemar_test, cohens_kappa, expected_calibration_error,
     format_compliance, xai_faithfulness, temperature_table,
     ratio_oracle_predictions, llm_error_rate, answered_only,
 )
-from ev_ids_agent_v6_triple_llm_v30 import (
-    make_llm_client, EVIDSAgentV6TripleLLMV30, build_xai_store,
+from ev_ids_agent_v6_triple_llm_v31 import (
+    make_llm_client, EVIDSAgentV6TripleLLMV31, build_xai_store,
     unload_ollama_model,
     auto_train_models_v6, get_column_mapping, classify_difficulty_zone,
     parse_datetime_to_timestamp, SHAP_AVAILABLE, LIME_AVAILABLE,
@@ -514,7 +514,7 @@ def run_classification(agent, emoji, label, selected, df, workers=1):
             if aborted:
                 print(f"\n  [CIRCUIT BREAKER] {label} stopped after {done} of "
                       f"{total} sessions.\n    {aborted}")
-                print(f"    Run 'python healthcheck_v30.py' to confirm the cause "
+                print(f"    Run 'python healthcheck_v31.py' to confirm the cause "
                       f"before retrying.")
                 break
     else:
@@ -542,7 +542,7 @@ def run_classification(agent, emoji, label, selected, df, workers=1):
                         print(f"\n  [CIRCUIT BREAKER] {label} stopping after "
                               f"{done} of {total} sessions.\n    {aborted}")
                         print(f"    Cancelling queued sessions. Run 'python "
-                              f"healthcheck_v30.py' to confirm the cause.")
+                              f"healthcheck_v31.py' to confirm the cause.")
                         for f in futs:
                             f.cancel()
                         break
@@ -602,7 +602,7 @@ def generate_confusion_heatmaps(results_dict, output_dir):
     # list, and pairing them positionally crashed confusion_matrix.
     panel_gt = {name: ground_truths for name in all_models_data}
     for llm_name, results in results_dict.items():
-        key = f"{llm_name} Agent (V30)"
+        key = f"{llm_name} Agent (V31)"
         all_models_data[key] = [r['predicted'] for r in results]
         panel_gt[key] = [r['ground_truth'] for r in results]
 
@@ -610,7 +610,7 @@ def generate_confusion_heatmaps(results_dict, output_dir):
     cols = 4
     rows = (n_models + cols - 1) // cols
     fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3.5))
-    fig.suptitle('Confusion Matrices — V30 (SHAP+LIME, always-classify)',
+    fig.suptitle('Confusion Matrices — V31 (SHAP+LIME, always-classify)',
                  fontsize=14, fontweight='bold', y=1.02)
     axes_flat = axes.flatten() if n_models > 1 else [axes]
 
@@ -645,7 +645,7 @@ def generate_confusion_heatmaps(results_dict, output_dir):
     for idx in range(len(all_models_data), len(axes_flat)):
         axes_flat[idx].set_visible(False)
     plt.tight_layout()
-    path = os.path.join(output_dir, 'confusion_matrices_v30.png')
+    path = os.path.join(output_dir, 'confusion_matrices_v31.png')
     fig.savefig(path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {path}")
@@ -708,7 +708,7 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
                 "SCENARIO C" if mem_on else "SCENARIO D")
 
     print(f"\n{'='*160}")
-    print(f"TRIPLE LLM COMPARISON — VERSION 6 V30 (SHAP+LIME, always-classify) | {sc_label}")
+    print(f"TRIPLE LLM COMPARISON — VERSION 6 V31 (SHAP+LIME, always-classify) | {sc_label}")
     print(f"{'='*160}")
     xai_on = results_llama[0]['result'].get('xai_enabled', True) if results_llama else True
     print(f"  SHAP: {'ON' if SHAP_AVAILABLE else 'OFF'}  |  "
@@ -773,7 +773,7 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
         print(f"  decided by any model. Their labels come from the ML majority, so")
         print(f"  the accuracy tables below mix model behaviour with transport")
         print(f"  failure. Two runs with different error counts will disagree even")
-        print(f"  at temperature 0. Fix the environment (healthcheck_v30.py) and")
+        print(f"  at temperature 0. Fix the environment (healthcheck_v31.py) and")
         print(f"  re-run before drawing any conclusion from these numbers.")
 
     # V23-COMPARABLE METRIC ----------------------------------------------------
@@ -831,9 +831,9 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
           f"{m['recall']:>6.4f} | {m['f1']:>6.4f} | {'—':>8} | "
           f"{len(results_llama):>5}")
     for llm_name, metrics, results in [
-            ('Llama Agent V30', llama_m['IDS_Agent'], results_llama),
-            ('Qwen Agent V30',  qwen_m['IDS_Agent'],  results_qwen),
-            ('GLM Agent V30',   glm_m['IDS_Agent'],   results_glm)]:
+            ('Llama Agent V31', llama_m['IDS_Agent'], results_llama),
+            ('Qwen Agent V31',  qwen_m['IDS_Agent'],  results_qwen),
+            ('GLM Agent V31',   glm_m['IDS_Agent'],   results_glm)]:
         m    = metrics
         n_fb = sum(1 for r in results if r['result'].get('used_fallback'))
         print(f"{llm_name:<20} | {m['tp']:>4} | {m['tn']:>4} | {m['fp']:>4} | {m['fn']:>4} | "
@@ -951,7 +951,7 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
 
     # COMPLEXITY
     print(f"\n{'='*120}")
-    print(f"COMPLEXITY (V30: bounded generation + shared XAI)")
+    print(f"COMPLEXITY (V31: bounded generation + shared XAI)")
     print(f"{'='*120}")
     print(f"\n  {'Metric':<28} | {'Llama':>10} | {'Qwen':>10} | {'GLM':>10}")
     print(f"  {'-'*65}")
@@ -1071,13 +1071,13 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
 
     # FINAL RANKINGS
     print(f"\n{'='*120}")
-    print(f"FINAL RANKINGS | {sc_label} | V30 (SHAP+LIME, always-classify)")
+    print(f"FINAL RANKINGS | {sc_label} | V31 (SHAP+LIME, always-classify)")
     print(f"{'='*120}")
     best_ml_name = max(ml_names, key=lambda m: llama_m[m]['accuracy'])
     all_ranked   = sorted([
-        ('GLM Agent V30',      glm_m['IDS_Agent']['accuracy']),
-        ('Qwen Agent V30',     qwen_m['IDS_Agent']['accuracy']),
-        ('Llama Agent V30',    llama_m['IDS_Agent']['accuracy']),
+        ('GLM Agent V31',      glm_m['IDS_Agent']['accuracy']),
+        ('Qwen Agent V31',     qwen_m['IDS_Agent']['accuracy']),
+        ('Llama Agent V31',    llama_m['IDS_Agent']['accuracy']),
         ('Majority Vote',      llama_m['Majority_Vote']['accuracy']),
         (best_ml_name,         llama_m[best_ml_name]['accuracy']),
     ], key=lambda x: x[1], reverse=True)
@@ -1108,7 +1108,7 @@ def run_temperature_sweep(config, backend, base_url, scenario_tag,
                 unload_ollama_model(model_name, base_url)
             print(f"\n--- {slot} @ temperature={t} ---")
             client = make_llm_client(backend, model_name, base_url, temperature=t)
-            agent  = EVIDSAgentV6TripleLLMV30(
+            agent  = EVIDSAgentV6TripleLLMV31(
                 config, client, use_knowledge=use_knowledge, use_memory=use_memory,
                 scenario_tag=f"{scenario_tag}_{slot}_T{t}",
                 xai_store=shared_store, verbose=False, print_lock=PRINT_LOCK,
@@ -1145,12 +1145,12 @@ def run_temperature_sweep(config, backend, base_url, scenario_tag,
 def main():
     print(f"""
 ========================================================================
-  EV-IDS-Agent VERSION 6 — TRIPLE LLM COMPARISON V30
+  EV-IDS-Agent VERSION 6 — TRIPLE LLM COMPARISON V31
   (built on V23 — same idea, objective, flow and prompts)
 
   Llama3 | Qwen3.5 | GLM-4.7-Flash
 
-  V30 = V23 pipeline + accumulated fixes:
+  V31 = V23 pipeline + accumulated fixes:
   - SHAP/LIME direction convention CORRECTED: attributions are taken against
     the Attack class, so "+ = toward Attack" is literally true. Previously
     every model predicting Normal had its direction inverted in the prompt,
@@ -1265,7 +1265,7 @@ XAI (SHAP + LIME) — ABLATION SWITCH
     # A substitution, if one is genuinely necessary, is a documented deviation
     # to be reported in the write-up, not a default.
     #
-    # Measured loaded footprints (see healthcheck_v30.py and vram_footprints.json):
+    # Measured loaded footprints (see healthcheck_v31.py and vram_footprints.json):
     #                     @num_ctx 8192   @num_ctx 6144
     #   llama3                  5.5 GB          5.2 GB
     #   qwen3.5                 5.8 GB          5.8 GB
@@ -1349,7 +1349,7 @@ XAI (SHAP + LIME) — ABLATION SWITCH
   Parallel slots share one KV cache: each worker gets a fraction of
   num_ctx, generation is starved, and calls run past the deadline.
   Use 1 unless you have verified the granted context at your worker
-  count with healthcheck_v30.py.""")
+  count with healthcheck_v31.py.""")
         try:
             workers = int(input("Parallel workers (1=sequential, 2-8) [1]: ").strip() or "1")
         except ValueError:
@@ -1370,7 +1370,7 @@ XAI (SHAP + LIME) — ABLATION SWITCH
                   "         Stage 2 generation budget to its 128-token floor, which is\n"
                   "         what produced GLM's empty answers and made two runs of\n"
                   "         identical code at temperature 0 disagree. Check the\n"
-                  "         'granted context' line in healthcheck_v30.py output at the\n"
+                  "         'granted context' line in healthcheck_v31.py output at the\n"
                   "         worker count you intend to use before trusting the results.")
             if input(f"  Type 'yes' to run with {workers} workers anyway: ")\
                     .strip().lower() != 'yes':
@@ -1477,7 +1477,7 @@ RUN MODE
                 print("  Aborted. Free VRAM and re-run.")
                 return
         print("\n  Before a long run, measure the cost first:")
-        print("      python healthcheck_v30.py --n <sample size>")
+        print("      python healthcheck_v31.py --n <sample size>")
         print("  It exercises the full two-stage pipeline on six unambiguous")
         print("  sessions per model and projects the total hours.")
 
@@ -1502,7 +1502,7 @@ RUN MODE
     # SHARED XAI STORE — SHAP/LIME computed once per sample for all 3 LLMs.
     # Build it from a throwaway agent's models/scaler (same pickles).
     print(f"\nBuilding shared XAI store (compute-once, disk-cached)...")
-    bootstrap = EVIDSAgentV6TripleLLMV30(config,
+    bootstrap = EVIDSAgentV6TripleLLMV31(config,
                     llm_client=type('Null', (), {'model_name': 'none'})(),
                     use_knowledge=False, use_memory=False,
                     scenario_tag='bootstrap', xai_store=None, verbose=False)
@@ -1510,7 +1510,7 @@ RUN MODE
 
     def make_agent(model_name):
         client = make_llm_client(backend, model_name, base_url)  # default temp
-        return EVIDSAgentV6TripleLLMV30(
+        return EVIDSAgentV6TripleLLMV31(
             config, client,
             use_knowledge=use_knowledge, use_memory=use_memory,
             scenario_tag=f"{scenario_tag}_{model_name.split(':')[0]}",
@@ -1566,11 +1566,11 @@ RUN MODE
                               results_dir, sc_k, use_xai=use_xai)
 
     ts           = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_file = os.path.join(results_dir, f"triple_llm_v6_v30_{scenario_tag}_{ts}.json")
+    results_file = os.path.join(results_dir, f"triple_llm_v6_v31_{scenario_tag}_{ts}.json")
     try:
         with open(results_file, 'w') as f:
             json.dump(make_json_serializable({
-                'version':       '6_triple_llm_v30',
+                'version':       '6_triple_llm_v31',
                 'scenario':      scenario_tag,
                 'backend':       backend,
                 'workers':       workers,
@@ -1590,7 +1590,7 @@ RUN MODE
         print(f"\nSaved: {results_file}")
     except Exception as e:
         print(f"\nSave error: {e}")
-    print(f"\nTRIPLE LLM V30 SCENARIO {choice} COMPLETE!\n")
+    print(f"\nTRIPLE LLM V31 SCENARIO {choice} COMPLETE!\n")
 
 
 if __name__ == "__main__":
