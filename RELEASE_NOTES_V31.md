@@ -58,6 +58,86 @@ SHAP recompute — minutes of KernelExplainer work — for no benefit.
 
 ---
 
+## 0b. Paper metrics (V31, metrics only — pipeline unchanged)
+
+`ev_ids_agent_v6_triple_llm_v31.py` is byte-for-byte unchanged by this work, and
+a standard run executes exactly the same detection pipeline as before. Every
+addition reads the results JSON a run saves.
+
+### `paper_metrics_v31.py`
+
+Run automatically at the end of every run, or by hand on any set of results:
+
+```
+python paper_metrics_v31.py results/triple_llm_v6_v31_*.json
+```
+
+It writes every table as CSV **and** LaTeX (booktabs) and every figure as PNG
+**and** PDF into `results/paper/<timestamp>/`, with a `README.md` index.
+
+| Output | IDS-Agent paper | What it shows |
+|---|---|---|
+| `table6_per_class_fscore` | Tables 6/7 | F-score per class (Normal, Attack, Macro Avg) for RF, LR, KNN, MLP, DT, SVC, GB, the majority vote and each LLM agent |
+| `table8a_sensitivity_posthoc_*` | Table 8, option (a) | Aggressive / Balanced / Conservative operating points from one run's own confidence. No re-run, no threshold fitted to the labels |
+| `table8b_sensitivity_prompted_*` | Table 8, option (b) | Runs with the paper's A.4 prompt instruction (run mode 4) |
+| `table9_ltm_lambda_*` | Table 9 | λ1 (recency) and λ2 (similarity) of the long-term-memory retrieval, the paper's Eq. 1 (run mode 5) |
+| `figure8_confidence_by_zone`, `_by_correct` | Figure 8 | Confidence histograms per classifier **and per LLM agent** |
+| `table_detection_metrics` | — | Acc, balanced acc, precision, recall/DR, specificity, FAR, FNR, F1, macro-F1, weighted-F1, MCC, ROC-AUC, PR-AUC, with TP/TN/FP/FN |
+| `table_statistics` | — | Bootstrap 95% CIs for accuracy, macro-F1 and MCC; McNemar for agent vs majority vote, vs best single classifier, vs the ratio rule |
+| `table_llm_agreement` | — | Pairwise McNemar and Cohen's κ, plus Fleiss' κ across the three LLMs |
+| `table_calibration`, `figure_calibration` | — | ECE, Brier, reliability diagram, risk-coverage curve and AURC |
+| `figure_roc_pr` | — | ROC and precision-recall curves |
+| `table_difficulty_zones` | — | Detection rate and false-alarm rate per ratio band |
+| `table_efficiency` | — | Latency per stage, total hours, prompt and response size |
+| `table_provenance_and_retrieval` | — | Where each verdict came from, and whether memory and RAG ever retrieved anything |
+| `table_xai_agreement` | — | SHAP–LIME top-feature agreement per classifier; XAI faithfulness |
+| `error_analysis.csv` | — | Every misclassified session with its ratio, zone and verdict source |
+| `table_seed_robustness` | — | Mean ± std across sampling seeds |
+| `table_ablation` | — | Scenarios A/B/C/D × XAI on/off, Δ vs Scenario D |
+| `table_temperature_*`, `figure_temperature_*` | — | Effect of decoding temperature |
+
+Every core metric was checked against scikit-learn on 3,000 random cases,
+degenerate ones included, and agrees to machine precision (≤ 2.2e-16); ROC-AUC
+and PR-AUC agree with tied scores.
+
+### Things to know before quoting these numbers
+
+- **Figure 8 is not an out-of-distribution result.** The paper's split is known
+  vs held-out attack types. This dataset has no held-out attack family, so the
+  figure splits by difficulty zone and by correct vs incorrect, and its title
+  says so.
+- **Attack sub-types are not broken out.** Classes are Normal and Attack.
+- **Table 8a is post-hoc.** "Sure" is the LLM's stated `CONFIDENCE: high`
+  (or, with `--sensitivity-source composite`, composite confidence ≥ 0.7 —
+  the paper's own low-confidence threshold from its A.5).
+- **"Best ML"** is the classifier with the highest macro-F1 on the same test
+  sessions, which favours the baseline; the McNemar comparison is therefore
+  conservative for the agent.
+- **Check the retrieval table before any memory or RAG claim.** If
+  sentence-transformers is missing, retrieval silently returns nothing and a
+  "with memory" run is really a "without memory" run. This is the most likely
+  explanation of the earlier finding that Scenarios A and D gave identical
+  results.
+- **LLM-error sessions** stay in the tables so n matches the run, but the
+  detection table warns whenever an agent has any.
+
+### Runner changes (reporting and saving only)
+
+- **Results are saved before the comparison prints**, and saved even if one
+  model returns nothing. Previously a reporting crash, or one empty model,
+  discarded every completed session of the other two.
+- Each session row now also records `xai_results` (already returned by
+  `detect()`, just not saved), for the SHAP–LIME agreement table.
+- Run metadata records `sensitivity`, `ltm_lambda`, `temperature` and
+  `self_consistency_k`, so the metrics can group runs without parsing filenames.
+- **Run mode 4 (Table 8b)** adds the paper's sentence to the Stage 2 question on
+  the agent *instance* only, for the three levels. **Run mode 5 (Table 9)**
+  replaces the memory retriever on the agent *instance* with the same formula
+  with λ1/λ2 as parameters, and refuses to start if memory cannot retrieve
+  anything. Neither touches the agent module, and at (0.3, 0.7) the λ retriever
+  is checked to return exactly what the agent's own method returns. Both run
+  unattended, with one LLM by default as in the paper.
+
 ## 1. The GLM problem, and what it actually was
 
 GLM was never failing at the task. Mechanical faults made it impossible for GLM

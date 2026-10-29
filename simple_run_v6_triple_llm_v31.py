@@ -10,6 +10,7 @@ RUN REQUIREMENTS
         ev_ids_agent_v6_triple_llm_v31.py
         simple_run_v6_triple_llm_v31.py
         llm_eval_metrics_v31.py
+        paper_metrics_v31.py
         selftest_v31.py  integration_test_v31.py  healthcheck_v31.py
     pip install shap lime ollama requests scikit-learn pandas numpy matplotlib
     Edit DATA_PATH in main() to point at your CSV.
@@ -24,6 +25,14 @@ RUN THE GATES FIRST — IN THIS ORDER
   neither Ollama nor your dataset; the third measures the real per-session cost
   and projects the total. Every unusable run this project has paid for was
   detectable by one of these three within minutes of starting.
+
+PAPER TABLES AND FIGURES
+  Every run ends by writing paper-ready tables (CSV + LaTeX) and figures
+  (PNG + PDF) to  <workspace>/results/paper/<timestamp>/ , indexed in its
+  README.md. They are computed from the saved results JSON, so they can be
+  regenerated or combined across runs at any time without a model:
+      python paper_metrics_v31.py results/triple_llm_v6_v31_*.json
+  Run modes 4 and 5 produce the paper's Table 8 option (b) and Table 9.
 
 WHAT THIS RUNNER PRODUCES
   - Full V23 per-session trace: every step, the Stage 1 prompt containing each
@@ -50,7 +59,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from collections import Counter
+from collections import Counter, OrderedDict
+from typing import Tuple
 from sklearn.metrics import confusion_matrix
 from llm_eval_metrics_v31 import (
     wilson_ci, mcnemar_test, cohens_kappa, expected_calibration_error,
@@ -62,8 +72,9 @@ from ev_ids_agent_v6_triple_llm_v31 import (
     unload_ollama_model,
     auto_train_models_v6, get_column_mapping, classify_difficulty_zone,
     parse_datetime_to_timestamp, SHAP_AVAILABLE, LIME_AVAILABLE,
-    NUM_CTX, min_viable_num_ctx, _env_num
+    NUM_CTX, min_viable_num_ctx, _env_num, LLM_TEMPERATURE
 )
+from paper_metrics_v31 import generate_paper_outputs
 
 PRINT_LOCK = threading.Lock()
 
@@ -417,7 +428,10 @@ def _classify_one(agent, idx, gt):
             'correct':           pred == gt,
             'model_predictions': result['model_predictions'],
             'result':            result['result'],
-            'majority_vote':     result['majority_vote']
+            'majority_vote':     result['majority_vote'],
+            # Recorded for the paper metrics (SHAP-LIME top-feature agreement).
+            # detect() already returns it; it was simply not being saved.
+            'xai_results':       result.get('xai_results', {}),
         }
     except Exception as e:
         with PRINT_LOCK:
@@ -427,12 +441,16 @@ def _classify_one(agent, idx, gt):
         return None
 
 
-def run_classification(agent, emoji, label, selected, df, workers=1):
+def run_classification(agent, emoji, label, selected, df, workers=1, confirm=True):
     print(f"\n{'='*80}")
     print(f"{emoji} RUNNING {label}  (workers={workers})")
     print(f"{'='*80}")
     results = []
-    input(f"\nPress Enter when {label} is ready...")
+    # A sweep runs several configurations back to back, usually unattended;
+    # pausing for Enter between them would stall an overnight run at the second
+    # configuration. Interactive runs keep the prompt.
+    if confirm:
+        input(f"\nPress Enter when {label} is ready...")
     if not test_llm_connectivity(agent.llm_client):
         print(f"[FAIL] {label} — skipping")
         return results
@@ -1134,12 +1152,171 @@ def run_temperature_sweep(config, backend, base_url, scenario_tag,
         with open(path, 'w') as f:
             json.dump(make_json_serializable(
                 {'temperatures': temps,
+                 'scenario':     scenario_tag,
+                 'llms':         dict(model_ids),
+                 'use_xai':      use_xai,
                  'sweep': {k: {str(t): v for t, v in d.items()}
                            for k, d in sweep.items()}}), f, indent=2)
         print(f"\n  Saved sweep data: {path}")
     except Exception as e:
         print(f"  Save error: {e}")
-    return sweep
+        path = None
+    return sweep, path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAPER EXPERIMENT MODES (opt-in; the default run never reaches this code)
+# ══════════════════════════════════════════════════════════════════════════════
+# Both modes change behaviour on the agent INSTANCE only. The agent module is
+# not edited, and a standard run is byte-for-byte the V31 pipeline.
+
+# IDS-Agent paper, Appendix A.4: "We adjust the detection sensitivity by
+# prompting the core LLM with 'Summarize the classification with {sensitivity}
+# sensitivity, {sensitivity details}'."
+SENSITIVITY_DETAILS = OrderedDict([
+    ('aggressive',   'discover the attack as the priority'),
+    ('balanced',     'balance the false alarm rate and the missing alarm rate'),
+    ('conservative', 'do not alert unless you are very sure'),
+])
+
+# The weights LongTermMemory.retrieve_similar hard-codes: 0.3*recency +
+# 0.7*similarity, i.e. the paper's Eq. 1 with lambda1=0.3, lambda2=0.7.
+# selftest asserts the agent source still says this.
+AGENT_LTM_LAMBDA = (0.3, 0.7)
+# Paper Table 9 settings, plus this framework's own default for reference.
+PAPER_LAMBDAS = [(0.1, 0.9), (0.5, 0.5), (0.9, 0.1), AGENT_LTM_LAMBDA]
+
+
+def sensitivity_stage2(level: str) -> str:
+    """The V31 Stage 2 question with the paper's sensitivity sentence added."""
+    base = EVIDSAgentV6TripleLLMV31.STAGE2_USER
+    first, rest = base.split('\n', 1)
+    return (f"{first} Summarize the classification with {level} sensitivity, "
+            f"{SENSITIVITY_DETAILS[level]}.\n{rest}")
+
+
+def weighted_retriever(ltm, lam1: float, lam2: float):
+    """
+    LongTermMemory.retrieve_similar with lambda1/lambda2 as parameters.
+
+    A line-for-line copy of the agent's method with the two constants replaced,
+    bound to one LTM instance. selftest checks that at (0.3, 0.7) it returns
+    exactly what the agent's own method returns, so the sweep's reference row
+    is the deployed behaviour and not an approximation of it.
+    """
+    def retrieve_similar(current_observations, timestamp, top_k=5):
+        if not ltm.memories or not ltm.embedding_model:
+            return []
+        try:
+            cur_emb = ltm.embedding_model.encode([current_observations]).tolist()[0]
+            scores  = []
+            for i, mem in enumerate(ltm.memories):
+                time_diff    = timestamp - mem.get('timestamp', 0)
+                max_td       = max([timestamp - m.get('timestamp', 0) for m in ltm.memories] + [1])
+                recency      = 1 - (time_diff / max_td) if max_td > 0 else 0
+                mem_obs      = mem.get('observations', '')
+                if mem_obs:
+                    mem_emb  = ltm.embedding_model.encode([mem_obs]).tolist()[0]
+                    cos_sim  = np.dot(cur_emb, mem_emb) / (
+                        np.linalg.norm(cur_emb) * np.linalg.norm(mem_emb) + 1e-10)
+                else:
+                    cos_sim  = 0
+                scores.append((lam1 * recency + lam2 * cos_sim, i))
+            scores.sort(reverse=True, key=lambda x: x[0])
+            return [ltm.memories[idx] for _, idx in scores[:top_k]]
+        except Exception:
+            return []
+    return retrieve_similar
+
+
+def ltm_is_live(agent) -> Tuple[bool, str]:
+    """
+    Can this agent's long-term memory actually return a case?
+
+    If sentence-transformers is missing or its model failed to download, the
+    agent's retrieval silently returns nothing. A lambda sweep on such a memory
+    measures nothing and would print identical rows, so it is refused.
+    """
+    ltm = getattr(agent, 'ltm', None)
+    if ltm is None:
+        return False, "the agent has no long-term memory (scenario without LTM)"
+    if not getattr(ltm, 'embedding_model', None):
+        return False, ("no embedding model is loaded, so retrieval always returns "
+                       "nothing (install sentence-transformers and make sure "
+                       "'all-MiniLM-L6-v2' can be downloaded)")
+    if not ltm.memories:
+        return False, "the memory is empty after seeding"
+    probe = ltm.retrieve_similar("requested=10.000kWh, delivered=10.000kWh",
+                                 datetime.now().timestamp(), top_k=1)
+    if not probe:
+        return False, "a probe retrieval returned no case"
+    return True, f"{len(ltm.memories)} cases stored, retrieval returns results"
+
+
+def run_paper_sweep(kind, settings, slots, config, backend, base_url, scenario_tag,
+                    use_knowledge, use_memory, use_xai, shared_store, selected, df,
+                    model_ids, results_dir, sc_k, train_indices, base_meta):
+    """
+    One full classification per (model, setting), each saved as its own results
+    JSON so paper_metrics_v31 can group them into Table 8 (b) or Table 9.
+
+    kind = 'sensitivity'  settings are levels: aggressive / balanced / conservative
+    kind = 'lambda'       settings are (lambda1, lambda2) pairs
+    """
+    files = []
+    previous = None
+    for slot in slots:
+        model_name = model_ids[slot]
+        for setting in settings:
+            if backend == 'ollama' and previous:
+                unload_ollama_model(previous, base_url)
+            previous = model_name
+            label = (f"{slot.upper()} sensitivity={setting}" if kind == 'sensitivity'
+                     else f"{slot.upper()} lambda1={setting[0]:g} lambda2={setting[1]:g}")
+            client = make_llm_client(backend, model_name, base_url)
+            agent  = EVIDSAgentV6TripleLLMV31(
+                config, client, use_knowledge=use_knowledge, use_memory=use_memory,
+                scenario_tag=f"{scenario_tag}_{slot}_{kind}",
+                xai_store=shared_store, verbose=True, print_lock=PRINT_LOCK,
+                self_consistency_k=sc_k, use_xai=use_xai)
+            if use_memory and agent.ltm:
+                agent.ltm.clear()
+                agent.seed_ltm_from_training(train_indices, n_seed=50)
+
+            meta = dict(base_meta)
+            if kind == 'sensitivity':
+                agent.STAGE2_USER = sensitivity_stage2(setting)
+                meta['sensitivity'] = setting
+                meta['ltm_lambda'] = list(AGENT_LTM_LAMBDA)
+            else:
+                live, why = ltm_is_live(agent)
+                if not live:
+                    print(f"\n  [LAMBDA SWEEP REFUSED] {why}.")
+                    print(f"  Every setting would retrieve nothing and print identical "
+                          f"rows, so the sweep would measure nothing.")
+                    return files
+                print(f"  [LTM] live: {why}")
+                agent.ltm.retrieve_similar = weighted_retriever(agent.ltm, *setting)
+                meta['sensitivity'] = 'none'
+                meta['ltm_lambda'] = list(setting)
+                meta['ltm_lambda_sweep'] = True
+
+            rows = run_classification(agent, f"[{slot.upper()}]", label, selected, df,
+                                      workers=1, confirm=False)
+            meta.update({'results_llama': [], 'results_glm': [], 'results_qwen': []})
+            meta[f'results_{slot}'] = rows
+            ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+            tag  = setting if kind == 'sensitivity' else f"lam{setting[0]:g}-{setting[1]:g}"
+            path = os.path.join(results_dir,
+                                f"triple_llm_v6_v31_{scenario_tag}_{kind}_{slot}_{tag}_{ts}.json")
+            try:
+                with open(path, 'w') as f:
+                    json.dump(make_json_serializable(meta), f, indent=2)
+                print(f"  Saved: {path}")
+                files.append(path)
+            except Exception as e:
+                print(f"  Save error: {e}")
+    return files
 
 
 def main():
@@ -1401,8 +1578,35 @@ RUN MODE
   2) temperature — sweep decoding temperature across all LLMs and report
                    "Effect of temperature on accuracy across LLM models"
   3) both        — standard run, then the temperature sweep
+  4) sensitivity — paper Table 8, option (b): re-run with the paper's
+                   prompt instruction at aggressive / balanced / conservative
+  5) lambda      — paper Table 9: re-run with the long-term-memory weights
+                   lambda1 (recency) / lambda2 (similarity). Needs LTM on.
+
+  Every mode ends by writing the paper tables and figures, including
+  Table 8 option (a): post-hoc sensitivity from the run itself, at no
+  extra cost. Modes 4 and 5 skip the standard three-model run.
 """)
-    run_mode = input("  Mode (1/2/3) [1]: ").strip() or "1"
+    run_mode = input("  Mode (1/2/3/4/5) [1]: ").strip() or "1"
+    paper_slots = ['llama']
+    paper_settings = None
+    if run_mode in ("4", "5"):
+        print("\n  The paper ran its sensitivity and lambda tables with one LLM.")
+        raw = input("  Models to sweep (llama,glm,qwen) [llama]: ").strip().lower()
+        if raw:
+            paper_slots = [s.strip() for s in raw.split(',')
+                           if s.strip() in ('llama', 'glm', 'qwen')] or ['llama']
+        if run_mode == "4":
+            paper_settings = list(SENSITIVITY_DETAILS)
+        else:
+            if not use_memory:
+                print("\n  [ABORT] The lambda sweep varies how long-term memory is "
+                      "retrieved,\n  so it needs a scenario with LTM on (A or C). "
+                      "Re-run and choose A or C.")
+                return
+            paper_settings = list(PAPER_LAMBDAS)
+        print(f"  Sweep: {len(paper_slots)} model(s) x {len(paper_settings)} settings "
+              f"= {len(paper_slots) * len(paper_settings)} full runs, workers=1")
     temps = [0.0, 0.2, 0.5, 0.7, 1.0]
     if run_mode in ("2", "3"):
         raw = input(f"  Temperatures (comma separated) {temps}: ").strip()
@@ -1518,6 +1722,41 @@ RUN MODE
             verbose=True, print_lock=PRINT_LOCK,
             self_consistency_k=sc_k, use_xai=use_xai)
 
+    # Run metadata. Recorded so the paper metrics can group runs into seed,
+    # ablation, sensitivity and lambda tables without parsing file names.
+    base_meta = {
+        'version':       '6_triple_llm_v31',
+        'scenario':      scenario_tag,
+        'backend':       backend,
+        'workers':       workers,
+        'use_knowledge': use_knowledge,
+        'use_memory':    use_memory,
+        'use_xai':       use_xai,
+        'sample_seed':   sample_seed,
+        'shap_used':     SHAP_AVAILABLE,
+        'lime_used':     LIME_AVAILABLE,
+        'description':   f'Scenario {choice}: {sc["desc"]}',
+        'llms':          {k: v for k, v in model_ids.items()},
+        'temperature':   LLM_TEMPERATURE,
+        'sensitivity':   'none',
+        'ltm_lambda':    list(AGENT_LTM_LAMBDA),
+        'self_consistency_k': sc_k,
+    }
+
+    # PAPER EXPERIMENT MODES — run the sweep only, then write the paper outputs.
+    if run_mode in ("4", "5"):
+        kind  = 'sensitivity' if run_mode == "4" else 'lambda'
+        files = run_paper_sweep(kind, paper_settings, paper_slots, config, backend,
+                                base_url, scenario_tag, use_knowledge, use_memory,
+                                use_xai, shared_store, selected, df, model_ids,
+                                results_dir, sc_k, train_indices, base_meta)
+        shared_store.save()
+        if files:
+            _write_paper_outputs(files, results_dir)
+        print(f"\nTRIPLE LLM V31 {kind.upper()} SWEEP COMPLETE "
+              f"({len(files)} run(s) saved)\n")
+        return
+
     # RUN LLAMA
     print(f"\nMANUAL: make sure {model_ids['llama']} is available on the backend")
     agent_llama = make_agent(model_ids["llama"])
@@ -1553,44 +1792,73 @@ RUN MODE
                                        selected, df, workers=workers)
     shared_store.save()
 
-    if results_llama and results_qwen and results_glm:
-        print_triple_comparison(results_llama, results_qwen, results_glm, results_dir)
-    else:
-        print("\nIncomplete results")
-        return
-
-    if run_mode in ("2", "3"):
-        run_temperature_sweep(config, backend, base_url, scenario_tag,
-                              use_knowledge, use_memory, shared_store,
-                              selected[:sweep_n], df, temps, model_ids,
-                              results_dir, sc_k, use_xai=use_xai)
-
+    # SAVE FIRST. The results used to be written only after the comparison
+    # printed, and not at all if any model came back empty -- so a crash in
+    # reporting, or one model failing, discarded every completed session of the
+    # other two. Hours of GPU time were lost that way on a 200-sample run. The
+    # raw results are now on disk before any analysis touches them.
     ts           = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_file = os.path.join(results_dir, f"triple_llm_v6_v31_{scenario_tag}_{ts}.json")
+    saved = False
     try:
         with open(results_file, 'w') as f:
-            json.dump(make_json_serializable({
-                'version':       '6_triple_llm_v31',
-                'scenario':      scenario_tag,
-                'backend':       backend,
-                'workers':       workers,
-                'use_knowledge': use_knowledge,
-                'use_memory':    use_memory,
-                'use_xai':       use_xai,
-                'sample_seed':   sample_seed,
-                'shap_used':     SHAP_AVAILABLE,
-                'lime_used':     LIME_AVAILABLE,
-                'timestamp':     ts,
-                'description':   f'Scenario {choice}: {sc["desc"]}',
-                'llms':          {k: v for k, v in model_ids.items()},
-                'results_llama': results_llama,
-                'results_qwen':  results_qwen,
-                'results_glm':   results_glm
-            }), f, indent=2)
+            json.dump(make_json_serializable(dict(
+                base_meta,
+                timestamp     = ts,
+                results_llama = results_llama,
+                results_qwen  = results_qwen,
+                results_glm   = results_glm)), f, indent=2)
         print(f"\nSaved: {results_file}")
+        saved = True
     except Exception as e:
         print(f"\nSave error: {e}")
+
+    if results_llama and results_qwen and results_glm:
+        try:
+            print_triple_comparison(results_llama, results_qwen, results_glm, results_dir)
+        except Exception:
+            import traceback
+            print("\n  [REPORTING ERROR] The comparison failed; the results are "
+                  "already saved and the paper metrics below still run.")
+            traceback.print_exc()
+    else:
+        empty = [n for n, r in (('Llama', results_llama), ('Qwen', results_qwen),
+                                ('GLM', results_glm)) if not r]
+        print(f"\nIncomplete results: no sessions for {', '.join(empty)}. The "
+              f"completed models are saved and analysed below.")
+
+    paper_inputs = [results_file] if saved else []
+    if run_mode in ("2", "3"):
+        _, sweep_file = run_temperature_sweep(config, backend, base_url, scenario_tag,
+                                              use_knowledge, use_memory, shared_store,
+                                              selected[:sweep_n], df, temps, model_ids,
+                                              results_dir, sc_k, use_xai=use_xai)
+        if sweep_file:
+            paper_inputs.append(sweep_file)
+
+    if paper_inputs:
+        _write_paper_outputs(paper_inputs, results_dir)
     print(f"\nTRIPLE LLM V31 SCENARIO {choice} COMPLETE!\n")
+
+
+def _write_paper_outputs(files, results_dir):
+    """
+    Paper tables and figures for this run. Never allowed to fail the run: the
+    results JSON is already on disk, and the same outputs can be regenerated
+    later with  python paper_metrics_v31.py <results json files>.
+    """
+    print(f"\n{'='*120}\nPAPER TABLES AND FIGURES\n{'='*120}")
+    try:
+        out = generate_paper_outputs(
+            files, out_dir=os.path.join(results_dir, 'paper',
+                                        datetime.now().strftime('%Y%m%d_%H%M%S')))
+        if out:
+            print(f"  Index of every table and figure: {os.path.join(out, 'README.md')}")
+    except Exception:
+        import traceback
+        print("  [PAPER METRICS ERROR] The results are saved; regenerate with:")
+        print(f"      python paper_metrics_v31.py {' '.join(files)}")
+        traceback.print_exc()
 
 
 if __name__ == "__main__":

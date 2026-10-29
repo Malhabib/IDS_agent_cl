@@ -127,6 +127,187 @@ def parse(stage2, votes, *, repair_used=False, llm_error=False, ratio=1.0):
         repair_used=repair_used, llm_error=llm_error)
 
 
+def _paper_metrics_checks():
+    import inspect, json, math, os, tempfile
+    import paper_metrics_v31 as P
+    import simple_run_v6_triple_llm_v31 as R
+
+    # ── core metrics, hand-computed: TP=3 TN=4 FP=1 FN=2 ────────────────────
+    m = P.binary_metrics([1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+                         [1, 1, 1, 0, 0, 0, 0, 0, 0, 1])
+    want = {'accuracy': 0.7, 'precision': 0.75, 'recall': 0.6,
+            'specificity': 0.8, 'far': 0.2, 'fnr': 0.4,
+            'balanced_accuracy': 0.7, 'f1': 2 * 0.75 * 0.6 / 1.35,
+            'mcc': (3 * 4 - 1 * 2) / math.sqrt(4 * 5 * 5 * 6)}
+    for k, v in want.items():
+        check(f"paper metric {k} matches hand calculation", round(m[k], 12), round(v, 12))
+    check("macro-F1 is the mean of the two class F1s",
+          round(m['macro_f1'], 12), round((m['f1'] + m['f1_normal']) / 2, 12))
+    check("a constant-Normal classifier has MCC 0, not an error",
+          P.binary_metrics([1, 0, 1, 0], [0, 0, 0, 0])['mcc'], 0.0)
+    check("ROC-AUC of a perfect ranking is 1", P.roc_auc([0, 0, 1, 1], [.1, .2, .8, .9]), 1.0)
+    check("ROC-AUC counts ties as one half", P.roc_auc([0, 1], [.5, .5]), 0.5)
+    check("ROC-AUC is undefined with one class", math.isnan(P.roc_auc([1, 1], [.2, .8])), True)
+    check("average precision of a perfect ranking is 1",
+          P.average_precision([0, 1, 1], [.1, .8, .9]), 1.0)
+    check("Fleiss' kappa is 1 under perfect agreement",
+          P.fleiss_kappa([[1, 0, 1, 0]] * 3), 1.0)
+    rc = P.risk_coverage([0.9, 0.8, 0.1], [True, True, False])
+    check("risk-coverage keeps the confident correct sessions first",
+          rc['risk'], [0.0, 0.0, 1 / 3])
+    check("Brier of perfectly confident correct verdicts is 0",
+          P.brier_confidence([1.0, 1.0], [True, True]), 0.0)
+
+    # ── sensitivity option (a): the paper's three instructions ──────────────
+    def srow(pred, conf):
+        return {'predicted': pred, 'ground_truth': pred,
+                'result': {'llm_confidence': conf, 'confidence': 0.8 if conf == 'high' else 0.5}}
+    rows = [srow('Malicious', 'high'), srow('Malicious', 'low'),
+            srow('Normal', 'high'), srow('Normal', 'low')]
+    check("aggressive alerts on every Attack and on unsure Normals",
+          P.apply_sensitivity(rows, 'aggressive'), [1, 1, 0, 1])
+    check("balanced is the deployed verdict", P.apply_sensitivity(rows, 'balanced'), [1, 1, 0, 0])
+    check("conservative alerts only on sure Attacks",
+          P.apply_sensitivity(rows, 'conservative'), [1, 0, 0, 0])
+    check("the composite source uses the paper's 0.7 threshold",
+          P.apply_sensitivity(rows, 'conservative', 'composite'), [1, 0, 0, 0])
+
+    # ── sensitivity option (b): the paper's A.4 sentence, nothing else ──────
+    base = A.EVIDSAgentV6TripleLLMV31.STAGE2_USER
+    for level, detail in R.SENSITIVITY_DETAILS.items():
+        q = R.sensitivity_stage2(level)
+        check(f"{level}: the paper's sentence is added",
+              f"Summarize the classification with {level} sensitivity, {detail}." in q, True)
+        check(f"{level}: the original Stage 2 question is otherwise intact",
+              q.replace(f" Summarize the classification with {level} sensitivity, "
+                        f"{detail}.", ""), base)
+    check("building a sensitivity prompt does not alter the class attribute",
+          A.EVIDSAgentV6TripleLLMV31.STAGE2_USER, base)
+
+    # ── Table 9: the lambda sweep must reproduce the deployed retrieval ─────
+    src = inspect.getsource(A.LongTermMemory.retrieve_similar)
+    check("the agent still weights memory as 0.3*recency + 0.7*similarity",
+          '0.3 * recency + 0.7 * cos_sim' in src, True)
+    check("the runner records the agent's real lambdas", R.AGENT_LTM_LAMBDA, (0.3, 0.7))
+
+    class FakeEncoder:
+        """Deterministic stand-in for sentence-transformers."""
+        def encode(self, texts):
+            import numpy as np
+            out = []
+            for t in texts:
+                v = np.zeros(16)
+                for i, ch in enumerate(t):
+                    v[(ord(ch) * (i + 1)) % 16] += 1.0
+                out.append(v)
+            return np.array(out)
+
+    with tempfile.TemporaryDirectory() as td:
+        ltm = A.LongTermMemory(td)
+        ltm.embedding_model = FakeEncoder()
+        texts = [f"requested={10 + i % 7:.3f}kWh, delivered={9 + (i * 3) % 11:.3f}kWh"
+                 for i in range(25)]
+        ltm.memories = [{'timestamp': 1000.0 + 37 * i, 'observations': t, 'id': i}
+                        for i, t in enumerate(texts)]
+        query, now = "requested=12.000kWh, delivered=14.500kWh", 2500.0
+        deployed = [m['id'] for m in ltm.retrieve_similar(query, now, top_k=5)]
+        swept = [m['id'] for m in R.weighted_retriever(ltm, 0.3, 0.7)(query, now, top_k=5)]
+        check("lambda sweep at (0.3, 0.7) returns exactly the deployed retrieval",
+              swept, deployed)
+        recency_only = [m['id'] for m in R.weighted_retriever(ltm, 1.0, 0.0)(query, now, top_k=5)]
+        check("lambda1=1 retrieves the most recent memories",
+              recency_only, [24, 23, 22, 21, 20])
+        check("the lambdas actually change what is retrieved",
+              recency_only != deployed, True)
+
+        class Agentish:
+            pass
+        ag = Agentish()
+        ag.ltm = A.LongTermMemory(os.path.join(td, 'dead'))
+        ag.ltm.embedding_model = None
+        ag.ltm.memories = list(ltm.memories)
+        live, why = R.ltm_is_live(ag)
+        check("a memory with no embedding model is reported as not live", live, False)
+        ag.ltm = ltm
+        check("a working memory is reported as live", R.ltm_is_live(ag)[0], True)
+
+    # ── the runner saves before it reports ─────────────────────────────────
+    main_src = inspect.getsource(R.main)
+    check("results are saved before the comparison is printed",
+          main_src.index('json.dump(make_json_serializable(dict(')
+          < main_src.index('print_triple_comparison('), True)
+    check("a failing comparison cannot discard the run",
+          'except Exception' in main_src[main_src.index('print_triple_comparison('):
+                                         main_src.index('print_triple_comparison(') + 400],
+          True)
+    check("sweeps run unattended (no Enter prompt between settings)",
+          'confirm=False' in inspect.getsource(R.run_paper_sweep), True)
+
+    # ── grouping and end-to-end output on a tiny synthetic run ─────────────
+    ML = list(P.ML_ORDER)
+
+    def row(i, truth, pred):
+        return {'index': i, 'ground_truth': truth, 'predicted': pred,
+                'correct': truth == pred, 'majority_vote': 'Normal',
+                'model_predictions': {mm: {'prediction': 'Normal', 'confidence': 0.6}
+                                      for mm in ML},
+                'xai_results': {mm: {'shap_ok': True, 'lime_ok': True,
+                                     'shap_top': 'Energy delivered',
+                                     'lime_top': 'Energy delivered'} for mm in ML},
+                'result': {'confidence': 0.8, 'llm_confidence': 'high',
+                           'verdict_source': 'stated', 'llm_error': False,
+                           'difficulty_zone': 'EASY_ATTACK' if truth == 'Malicious'
+                                              else 'EASY_NORMAL',
+                           'delivery_ratio': 1.8 if truth == 'Malicious' else 1.0,
+                           'xai_top_feature': 'Energy delivered',
+                           'llm_xai_assessment': 'Energy delivered dominates',
+                           'ltm_cases_referenced': 2, 'rag_sources_used': 0,
+                           'complexity': {'llm_latency_sec': 10.0}}}
+
+    truths = ['Malicious' if i % 2 else 'Normal' for i in range(12)]
+    with tempfile.TemporaryDirectory() as td:
+        def dump(name, **meta):
+            d = {'use_knowledge': False, 'use_memory': True, 'use_xai': True,
+                 'sample_seed': meta.pop('seed', 42),
+                 'llms': {'llama': 'llama3:latest', 'qwen': 'qwen3.5:latest'},
+                 'results_llama': [row(i, t, t) for i, t in enumerate(truths)],
+                 'results_qwen': [row(i, t, t if i % 5 else 'Normal')
+                                  for i, t in enumerate(truths)],
+                 'results_glm': []}
+            d.update(meta)
+            p = os.path.join(td, name)
+            with open(p, 'w') as f:
+                json.dump(d, f)
+            return p
+
+        files = [dump('std42.json'), dump('std7.json', seed=7),
+                 dump('lam.json', ltm_lambda=[0.3, 0.7], ltm_lambda_sweep=True)]
+        runs, _ = P.load_runs(files)
+        check("a lambda-sweep cell at default weights is not a standard run",
+              [r.is_standard for r in runs], [True, True, False])
+        seed_t = P.table_seed_robustness(runs)
+        check("the seed table counts only the standard runs",
+              {row_[2] for row_ in seed_t.rows}, {2})
+
+        out = P.generate_paper_outputs(files, os.path.join(td, 'out'), n_boot=50,
+                                       verbose=False)
+        produced = set()
+        for root, _, fs in os.walk(out):
+            produced |= set(fs)
+        for name in ('README.md', 'table6_per_class_fscore.csv',
+                     'table6_per_class_fscore.tex', 'table_detection_metrics.csv',
+                     'table_statistics.csv', 'table_calibration.csv',
+                     'table_provenance_and_retrieval.csv', 'table_xai_agreement.csv',
+                     'figure8_confidence_by_zone.png', 'figure8_confidence_by_correct.pdf',
+                     'figure_roc_pr.png', 'figure_calibration.png', 'error_analysis.csv',
+                     'table_seed_robustness.csv'):
+            check(f"paper output {name} is written", name in produced, True)
+        with open(os.path.join(out, 'README.md'), encoding='utf-8') as f:
+            readme = f.read()
+        check("the README states that Figure 8 is not out-of-distribution",
+              'not an out-of-distribution evaluation' in readme, True)
+
+
 def main():
     # 1 ── verdict formats
     for text, want in VERDICT_CASES:
@@ -495,6 +676,16 @@ def main():
               [r['index'] for r in R._restrict(full_a, [3, 1])], [3, 1])
     except Exception as e:
         FAIL.append(f"runner import failed: {e}")
+
+    # 10 ── PAPER METRICS. Every number in the paper tables comes from here, so
+    #       the core metrics are pinned to hand-computed values, and the
+    #       experiment modes are checked against the pipeline they must not alter.
+    try:
+        _paper_metrics_checks()
+    except Exception as e:
+        import traceback
+        FAIL.append(f"paper metrics checks crashed: {type(e).__name__}: {e}\n"
+                    + traceback.format_exc())
 
     # ── report ──────────────────────────────────────────────────────────────
     # Printed first so a stale copy is obvious before any result is read.
