@@ -1,16 +1,16 @@
-# paper_metrics_v31.py
+# paper_metrics_v32.py
 """
-Paper-ready metrics, tables and figures for EV-IDS-Agent V31.
+Paper-ready metrics, tables and figures for EV-IDS-Agent V32.
 
 Reads the results JSON files the runner writes and produces every table and
 figure as CSV + LaTeX and PNG + PDF. It never calls a model and never touches
 the detection pipeline: everything here is computed after the fact from what a
 run saved, so it costs no GPU time and works on runs already finished.
 
-    python paper_metrics_v31.py results/triple_llm_v6_v31_*.json
-    python paper_metrics_v31.py run_a.json run_b.json --out paper_out
+    python paper_metrics_v32.py results/triple_llm_v6_v32_*.json
+    python paper_metrics_v32.py run_a.json run_b.json --out paper_out
 
-Mapping to the IDS-Agent paper (Li et al.) -- see RELEASE_NOTES_V31.md:
+Mapping to the IDS-Agent paper (Li et al.) -- see RELEASE_NOTES_V32.md:
 
   Tables 6/7  per-class F-score of each classifier, the majority vote and the
               agent. Classes here are Normal and Attack (binary task; attack
@@ -43,7 +43,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from llm_eval_metrics_v31 import (mcnemar_test, cohens_kappa,
+from llm_eval_metrics_v32 import (mcnemar_test, cohens_kappa,
                                   expected_calibration_error, xai_faithfulness,
                                   format_compliance, llm_error_rate)
 
@@ -893,7 +893,7 @@ def table_xai(run: Run, idx) -> Table:
     notes = []
     if not have_xai:
         notes.append("This run predates per-session XAI recording; re-run with the "
-                     "V31 runner to fill this table.")
+                     "V32 runner to fill this table.")
     for name, rws in run.agents.items():
         xf = xai_faithfulness(restrict(rws, idx))
         notes.append(f"{name} Agent cites the dominant SHAP feature in "
@@ -1191,7 +1191,7 @@ def table_lambda(runs: List[Run]) -> List[Table]:
         safe = name.replace(' ', '_').replace('.', '_')
         notes = ["λ1 weights recency and λ2 cosine similarity in long-term-memory "
                  "retrieval (paper Eq. 1). Precision and recall are macro-averaged.",
-                 f"Default in V31: λ1={DEFAULT_LTM_LAMBDA[0]:g}, λ2={DEFAULT_LTM_LAMBDA[1]:g}."]
+                 f"Default in V32: λ1={DEFAULT_LTM_LAMBDA[0]:g}, λ2={DEFAULT_LTM_LAMBDA[1]:g}."]
         if all(row[-1].startswith('0/') for row in rows):
             notes.append("WARNING: no session retrieved a memory case in any setting, "
                          "so λ cannot have had an effect. The memory was not live.")
@@ -1306,7 +1306,7 @@ def generate_paper_outputs(paths: Sequence[str], out_dir: Optional[str] = None,
         base = os.path.dirname(os.path.abspath(runs[0].path if runs else sweeps[0][0]))
         out_dir = os.path.join(base, 'paper', datetime.now().strftime('%Y%m%d_%H%M%S'))
     os.makedirs(out_dir, exist_ok=True)
-    index = [f"# Paper outputs — EV-IDS-Agent V31",
+    index = [f"# Paper outputs — EV-IDS-Agent V32",
              f"", f"Generated {datetime.now():%Y-%m-%d %H:%M} from {len(runs)} run(s)"
              f" and {len(sweeps)} temperature sweep(s).", "",
              "LaTeX tables use `\\usepackage{booktabs}`.", ""]

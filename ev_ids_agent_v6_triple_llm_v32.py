@@ -1,6 +1,6 @@
-# ev_ids_agent_v6_triple_llm_v31.py
+# ev_ids_agent_v6_triple_llm_v32.py
 """
-EV-IDS-Agent VERSION 6 - TRIPLE LLM V31
+EV-IDS-Agent VERSION 6 - TRIPLE LLM V32
 
 HEADLINE CHANGE IN V30 — GLM, AND THE END OF UNMEASURABLE RUNS
   GLM's poor and unstable scores were not a prompt problem, a parsing problem
@@ -35,9 +35,9 @@ HEADLINE CHANGE IN V30 — GLM, AND THE END OF UNMEASURABLE RUNS
 
   Supporting these, V30 adds three gates that run BEFORE a study, so a broken
   environment costs minutes instead of two days:
-     selftest_v31.py         seconds  no GPU   decision-path assertions
-     integration_test_v31.py ~1 min   no GPU   full pipeline on synthetic data
-     healthcheck_v31.py      minutes  GPU      per-model cost and verdict rate
+     selftest_v32.py         seconds  no GPU   decision-path assertions
+     integration_test_v32.py ~1 min   no GPU   full pipeline on synthetic data
+     healthcheck_v32.py      minutes  GPU      per-model cost and verdict rate
   and a circuit breaker inside the run itself, which stops after five sessions
   if calls are failing or the projected wall-clock is implausible.
 
@@ -96,7 +96,7 @@ FIX HISTORY FOLDED INTO THIS VERSION
       discarded when they are retrained, so stale SHAP/LIME can never be fed
       into the prompt.
 
-REQUIRES (same folder): simple_run_v6_triple_llm_v28.py, llm_eval_metrics_v31.py
+REQUIRES (same folder): simple_run_v6_triple_llm_v32.py, llm_eval_metrics_v32.py
     pip install shap lime ollama requests scikit-learn pandas numpy
 """
 
@@ -1473,7 +1473,7 @@ class LongTermMemory:
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN AGENT — V25 (V23 flow and prompts, performance-fixed)
 # ══════════════════════════════════════════════════════════════════════════════
-class EVIDSAgentV6TripleLLMV31:
+class EVIDSAgentV6TripleLLMV32:
     """
     Same idea, objective, 7-step flow and prompts as V23.
     V25 differences are implementation-only:
@@ -1992,10 +1992,10 @@ Provide your structured analysis using the format in your instructions."""
             "ltm_cases_referenced": len(ltm_cases),
             "rag_sources_used":     len(rag_sources),
             "classifier_votes":     dict(votes),
-            "aggregation_method":   ("V31_RAG_LTM_XAI" if (self.use_knowledge and self.use_memory)
-                                     else "V31_RAG_XAI"  if self.use_knowledge
-                                     else "V31_LTM_XAI"  if self.use_memory
-                                     else "V31_ML_XAI"),
+            "aggregation_method":   ("V32_RAG_LTM_XAI" if (self.use_knowledge and self.use_memory)
+                                     else "V32_RAG_XAI"  if self.use_knowledge
+                                     else "V32_LTM_XAI"  if self.use_memory
+                                     else "V32_ML_XAI"),
             "complexity":           complexity_metrics
         }
 
