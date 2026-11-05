@@ -1,4 +1,4 @@
-# EV-IDS-Agent V6 — Triple LLM, V32
+# EV-IDS-Agent V6 — Triple LLM, V33
 
 Pipeline, prompts, the seven-step detection flow, the A/B/C/D scenarios and the
 V23-style per-session explainability output are **unchanged**. Everything below
@@ -7,36 +7,53 @@ happened.
 
 ---
 
-## V32 at a glance
+## V33 at a glance
 
-**V32 = V31 + the paper-metrics layer (§0b).** Nothing in the detection
-pipeline changed. Mapping the V32 agent module's version text back to V31
-reproduces the committed V31 file exactly; the only other edit is a docstring
-that had named `simple_run_v6_triple_llm_v28.py` as its runner since V28.
+**V33 = V32 + one round of fixes to how results are run and reported.** The
+detection pipeline is unchanged: mapping the V33 agent module's version text
+back to V32 reproduces the committed V32 file exactly, and V32 was itself the
+V31 pipeline.
+
+What changed since V32 (details in §0b):
+
+- **Three run modes, and every one produces every paper artifact.** The
+  separate modes for Table 8 (b) and Table 9 are gone; their runs happen inside
+  modes 1–3 after the main comparison, on one LLM as in the paper. The deployed
+  λ row is taken from the main run, not run twice.
+- **Table 10** (execution time per instance) and **Figure 7** (confusion
+  matrices of the majority vote and each agent) added, completing the paper's
+  Tables 6–10 and Figures 7–8. A checklist of these ends every run.
+- **An agent that stops early no longer shrinks the tables.** Below 90% of the
+  sessions it is reported on its own and kept out of the comparisons.
+- **Completing a run without repeating it:** re-run one model and merge it with
+  the earlier results file.
+- **RAG reporting corrected:** with no knowledge base, the fixed built-in
+  knowledge text is reported as such, not as retrieval.
 
 Files (all in one folder):
 
 ```
-ev_ids_agent_v6_triple_llm_v32.py   detection pipeline (unchanged since V31)
-simple_run_v6_triple_llm_v32.py     interactive runner, run modes 1–3
-paper_metrics_v32.py                paper tables and figures from results JSON
-llm_eval_metrics_v32.py             statistics helpers
-selftest_v32.py                     offline gate, seconds
-integration_test_v32.py             end-to-end gate on synthetic data, ~1 min
-healthcheck_v32.py                  live-model gate, minutes
+ev_ids_agent_v6_triple_llm_v33.py   detection pipeline (unchanged since V31)
+simple_run_v6_triple_llm_v33.py     interactive runner, run modes 1–3
+paper_metrics_v33.py                paper tables and figures from results JSON
+llm_eval_metrics_v33.py             statistics helpers
+selftest_v33.py                     offline gate, seconds
+integration_test_v33.py             end-to-end gate on synthetic data, ~1 min
+healthcheck_v33.py                  live-model gate, minutes
 ```
 
 Run order:
 
 ```
-python selftest_v32.py
-python integration_test_v32.py
-python healthcheck_v32.py --n 50
-python simple_run_v6_triple_llm_v32.py
+python selftest_v33.py
+python integration_test_v33.py
+python healthcheck_v33.py --n 50
+python simple_run_v6_triple_llm_v33.py
 ```
 
-Results from V31 runs can be read by `paper_metrics_v32.py` unchanged; the
-results format is the same. The XAI cache (`xai_cache.pkl`) carries over too.
+The results format is unchanged, so results from V31 and V32 runs load into
+`paper_metrics_v33.py` as they are, and can be merged with V33 runs. The XAI
+cache (`xai_cache.pkl`) carries over.
 
 ---
 
@@ -93,16 +110,16 @@ SHAP recompute — minutes of KernelExplainer work — for no benefit.
 
 ## 0b. Paper metrics (added on V31, released as V32; metrics only)
 
-`ev_ids_agent_v6_triple_llm_v32.py` is byte-for-byte unchanged by this work, and
+`ev_ids_agent_v6_triple_llm_v33.py` is byte-for-byte unchanged by this work, and
 a standard run executes exactly the same detection pipeline as before. Every
 addition reads the results JSON a run saves.
 
-### `paper_metrics_v32.py`
+### `paper_metrics_v33.py`
 
 Run automatically at the end of every run, or by hand on any set of results:
 
 ```
-python paper_metrics_v32.py results/triple_llm_v6_v32_*.json
+python paper_metrics_v33.py results/triple_llm_v6_v33_*.json
 ```
 
 It writes every table as CSV **and** LaTeX (booktabs) and every figure as PNG
@@ -198,7 +215,7 @@ tables then merge the two files, taking each model from the file in which it
 completed most sessions. By hand:
 
 ```
-python paper_metrics_v32.py earlier.json glm_only.json --merge
+python paper_metrics_v33.py earlier.json glm_only.json --merge
 ```
 
 A merge is refused if the files cover different sessions.
@@ -346,7 +363,7 @@ make the outputs wrong — CPU inference is still inference — but it is the di
 source of the multi-day runtime, and it means Qwen was never measured under the
 same conditions as the other two models.
 
-The advisor in `healthcheck_v32.py` now distinguishes weights from loaded
+The advisor in `healthcheck_v33.py` now distinguishes weights from loaded
 footprint and states which models fit at 8192, which fit only at 4096, and which
 cannot fit at all.
 
@@ -366,7 +383,7 @@ Where a target does not fit, the levers are, in order:
 1. **Free VRAM.** Desktop applications held 1.7–7.7 GB on the test machine.
 2. **Lower `num_ctx`.** The KV cache scales with the window, so this changes
    the VRAM a model needs *without changing the model*.
-   `set EV_IDS_NUM_CTX=6144`, or `healthcheck_v32.py --num-ctx 6144`.
+   `set EV_IDS_NUM_CTX=6144`, or `healthcheck_v33.py --num-ctx 6144`.
 3. **A larger GPU.** `glm-4.7-flash` is 19 GB and needs a 24 GB card.
 
 `num_ctx` has a hard floor, computed by `min_viable_num_ctx()` from the actual
@@ -387,9 +404,9 @@ Run them in order. Each must exit 0 before the next is worth running.
 
 | gate | time | needs | catches |
 |---|---|---|---|
-| `python selftest_v32.py` | seconds | nothing | verdict/section parsing, provenance, budget arithmetic, SHAP sign, renamed-symbol `NameError`s |
-| `python integration_test_v32.py` | ~1 min | nothing | the seven steps wired together: real classifiers, real SHAP, scripted model, 41 assertions |
-| `python healthcheck_v32.py --n 50` | minutes | Ollama | VRAM residency, the context actually granted, verdict rate, error rate, and the **projected total hours** |
+| `python selftest_v33.py` | seconds | nothing | verdict/section parsing, provenance, budget arithmetic, SHAP sign, renamed-symbol `NameError`s |
+| `python integration_test_v33.py` | ~1 min | nothing | the seven steps wired together: real classifiers, real SHAP, scripted model, 41 assertions |
+| `python healthcheck_v33.py --n 50` | minutes | Ollama | VRAM residency, the context actually granted, verdict rate, error rate, and the **projected total hours** |
 
 Neither of the first two needs Ollama, a GPU, or your dataset — the integration
 test generates synthetic sessions and trains the seven classifiers on them.
@@ -432,7 +449,7 @@ instruction asked for a prediction, contradicting the framework's own system
 prompt, which reserves the verdict for Stage 2.
 
 Every block now tracks the session, the repair call is included, and
-`selftest_v32.py` asserts all of it — 75 assertions — so it cannot regress.
+`selftest_v33.py` asserts all of it — 75 assertions — so it cannot regress.
 Raw Stage 1, Stage 2 and repair responses are written to
 `healthcheck_transcript_<model>.txt` on every run, because diagnosing "no
 verdict stated" from a counter alone is guesswork.

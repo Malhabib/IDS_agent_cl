@@ -1,6 +1,6 @@
-# selftest_v32.py
+# selftest_v33.py
 """
-Offline correctness gate for V32. No GPU, no Ollama, no dataset, no models.
+Offline correctness gate for V33. No GPU, no Ollama, no dataset, no models.
 
 Why this exists
 ---------------
@@ -19,17 +19,17 @@ in the code and would have been caught in seconds:
 None of those needed a GPU to detect. This script asserts the behaviour of the
 decision path directly, with a scripted fake model, and runs in under a second.
 
-    python selftest_v32.py
+    python selftest_v33.py
 
 Exit code 0 means the decision path behaves as specified. It does NOT mean the
-models are healthy -- that is what healthcheck_v32.py measures. Run this first
+models are healthy -- that is what healthcheck_v33.py measures. Run this first
 (seconds), the healthcheck second (minutes), the study last (hours).
 """
 
 import sys
 import numpy as np
 
-import ev_ids_agent_v6_triple_llm_v32 as A
+import ev_ids_agent_v6_triple_llm_v33 as A
 
 PASS, FAIL = [], []
 
@@ -121,7 +121,7 @@ def parse(stage2, votes, *, repair_used=False, llm_error=False, ratio=1.0):
     stub = StubAgent()
     preds = {m: {'prediction': p, 'confidence': 0.6}
              for m, p in votes.items()}
-    return A.EVIDSAgentV6TripleLLMV32._parse_llm_response(
+    return A.EVIDSAgentV6TripleLLMV33._parse_llm_response(
         stub, stage2, "stage 1 text", preds, ratio, 2.0, 1,
         Counter(votes.values()), [], [], {}, "EASY_NORMAL",
         repair_used=repair_used, llm_error=llm_error)
@@ -129,8 +129,8 @@ def parse(stage2, votes, *, repair_used=False, llm_error=False, ratio=1.0):
 
 def _paper_metrics_checks():
     import inspect, json, math, os, tempfile
-    import paper_metrics_v32 as P
-    import simple_run_v6_triple_llm_v32 as R
+    import paper_metrics_v33 as P
+    import simple_run_v6_triple_llm_v33 as R
 
     # ── core metrics, hand-computed: TP=3 TN=4 FP=1 FN=2 ────────────────────
     m = P.binary_metrics([1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
@@ -173,7 +173,7 @@ def _paper_metrics_checks():
           P.apply_sensitivity(rows, 'conservative', 'composite'), [1, 0, 0, 0])
 
     # ── sensitivity option (b): the paper's A.4 sentence, nothing else ──────
-    base = A.EVIDSAgentV6TripleLLMV32.STAGE2_USER
+    base = A.EVIDSAgentV6TripleLLMV33.STAGE2_USER
     for level, detail in R.SENSITIVITY_DETAILS.items():
         q = R.sensitivity_stage2(level)
         check(f"{level}: the paper's sentence is added",
@@ -182,7 +182,7 @@ def _paper_metrics_checks():
               q.replace(f" Summarize the classification with {level} sensitivity, "
                         f"{detail}.", ""), base)
     check("building a sensitivity prompt does not alter the class attribute",
-          A.EVIDSAgentV6TripleLLMV32.STAGE2_USER, base)
+          A.EVIDSAgentV6TripleLLMV33.STAGE2_USER, base)
 
     # ── Table 9: the lambda sweep must reproduce the deployed retrieval ─────
     src = inspect.getsource(A.LongTermMemory.retrieve_similar)
@@ -462,7 +462,7 @@ def main():
               pol['repeat_penalty'] <= 1.15, True)
     # The repair read-out must outlast a model that reasons anyway.
     check("the repair budget survives an unrequested reasoning channel",
-          A.EVIDSAgentV6TripleLLMV32._repair_budget(None) >= 256, True)
+          A.EVIDSAgentV6TripleLLMV33._repair_budget(None) >= 256, True)
     # A repair that returns reasoning instead of one word must still be read.
     # Splicing the whole blob after "Prediction: " produced an unmatchable line,
     # so a repair that HAD concluded was recorded as a failure.
@@ -492,7 +492,7 @@ def main():
     for attr in ('detect', '_parse_llm_response', '_build_stage1_prompt',
                  '_get_system_prompt', '_repair_budget', 'seed_ltm_from_training'):
         check(f"agent.{attr} exists",
-              hasattr(A.EVIDSAgentV6TripleLLMV32, attr), True)
+              hasattr(A.EVIDSAgentV6TripleLLMV33, attr), True)
     for fn in ('make_llm_client', 'unload_ollama_model', 'extract_verdict',
                'extract_section', 'gen_policy_for', 'auto_train_models_v6',
                'get_column_mapping', 'classify_difficulty_zone'):
@@ -517,7 +517,7 @@ def main():
     #      measured contradiction-resolution, not the task, and it produced a
     #      misleading accuracy column for Llama and GLM.
     try:
-        import healthcheck_v32 as H
+        import healthcheck_v33 as H
 
         def tally(ratio):
             line = [l for l in H.evidence_for(ratio).split('\n')
@@ -610,16 +610,16 @@ def main():
         check("probe prompt is realistically sized",
               len(H.SYSTEM) + len(p) > 7000, True)
         check("healthcheck uses the framework's own system prompt",
-              H.SYSTEM == A.EVIDSAgentV6TripleLLMV32._get_system_prompt(None), True)
+              H.SYSTEM == A.EVIDSAgentV6TripleLLMV33._get_system_prompt(None), True)
         check("healthcheck uses the framework's own Stage 2 question",
-              H.STAGE2_QUESTION == A.EVIDSAgentV6TripleLLMV32.STAGE2_USER, True)
+              H.STAGE2_QUESTION == A.EVIDSAgentV6TripleLLMV33.STAGE2_USER, True)
     except Exception as e:
         FAIL.append(f"healthcheck import/probe failed: {e}")
 
     # 9 ── the runner imports what it says it imports
     try:
         import inspect
-        import simple_run_v6_triple_llm_v32 as R
+        import simple_run_v6_triple_llm_v33 as R
         for fn in ('preflight_gpu_residency', 'check_gpu_residency',
                    'verify_models_installed', 'calculate_metrics',
                    'run_classification', 'main'):
@@ -744,7 +744,7 @@ def main():
     # ── report ──────────────────────────────────────────────────────────────
     # Printed first so a stale copy is obvious before any result is read.
     print(f"\n{A.config_banner()}")
-    print(f"\n  V32 OFFLINE SELF-TEST")
+    print(f"\n  V33 OFFLINE SELF-TEST")
     print(f"  {'-'*66}")
     print(f"  passed : {len(PASS)}")
     print(f"  failed : {len(FAIL)}")
@@ -755,7 +755,7 @@ def main():
         print(f"\n  Do NOT start a run. Fix these first.")
         return 1
     print(f"\n  The decision path behaves as specified.")
-    print(f"  Next: python healthcheck_v32.py   (minutes, needs Ollama)")
+    print(f"  Next: python healthcheck_v33.py   (minutes, needs Ollama)")
     return 0
 
 
