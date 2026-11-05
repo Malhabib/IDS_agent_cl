@@ -18,7 +18,7 @@ Files (all in one folder):
 
 ```
 ev_ids_agent_v6_triple_llm_v32.py   detection pipeline (unchanged since V31)
-simple_run_v6_triple_llm_v32.py     interactive runner, run modes 1–5
+simple_run_v6_triple_llm_v32.py     interactive runner, run modes 1–3
 paper_metrics_v32.py                paper tables and figures from results JSON
 llm_eval_metrics_v32.py             statistics helpers
 selftest_v32.py                     offline gate, seconds
@@ -112,8 +112,11 @@ It writes every table as CSV **and** LaTeX (booktabs) and every figure as PNG
 |---|---|---|
 | `table6_per_class_fscore` | Tables 6/7 | F-score per class (Normal, Attack, Macro Avg) for RF, LR, KNN, MLP, DT, SVC, GB, the majority vote and each LLM agent |
 | `table8a_sensitivity_posthoc_*` | Table 8, option (a) | Aggressive / Balanced / Conservative operating points from one run's own confidence. No re-run, no threshold fitted to the labels |
-| `table8b_sensitivity_prompted_*` | Table 8, option (b) | Runs with the paper's A.4 prompt instruction (run mode 4) |
-| `table9_ltm_lambda_*` | Table 9 | λ1 (recency) and λ2 (similarity) of the long-term-memory retrieval, the paper's Eq. 1 (run mode 5) |
+| `table8b_sensitivity_prompted_*` | Table 8, option (b) | Runs with the paper's A.4 prompt instruction (paper experiments, every mode) |
+| `table9_ltm_lambda_*` | Table 9 | λ1 (recency) and λ2 (similarity) of the long-term-memory retrieval, the paper's Eq. 1 (paper experiments, Scenarios A and C) |
+| `table10_execution_time` | Table 10 | Average time per instance: the framework without its LLM vs each LLM agent |
+| `figure7_confusion_matrices` | Figure 7 | Confusion matrices of the majority vote and each LLM agent |
+| `table_incomplete_agents` | — | Any agent that stopped early, with its error rate and the projected cost of a full run |
 | `figure8_confidence_by_zone`, `_by_correct` | Figure 8 | Confidence histograms per classifier **and per LLM agent** |
 | `table_detection_metrics` | — | Acc, balanced acc, precision, recall/DR, specificity, FAR, FNR, F1, macro-F1, weighted-F1, MCC, ROC-AUC, PR-AUC, with TP/TN/FP/FN |
 | `table_statistics` | — | Bootstrap 95% CIs for accuracy, macro-F1 and MCC; McNemar for agent vs majority vote, vs best single classifier, vs the ratio rule |
@@ -163,13 +166,51 @@ and PR-AUC agree with tied scores.
   `detect()`, just not saved), for the SHAP–LIME agreement table.
 - Run metadata records `sensitivity`, `ltm_lambda`, `temperature` and
   `self_consistency_k`, so the metrics can group runs without parsing filenames.
-- **Run mode 4 (Table 8b)** adds the paper's sentence to the Stage 2 question on
-  the agent *instance* only, for the three levels. **Run mode 5 (Table 9)**
-  replaces the memory retriever on the agent *instance* with the same formula
-  with λ1/λ2 as parameters, and refuses to start if memory cannot retrieve
-  anything. Neither touches the agent module, and at (0.3, 0.7) the λ retriever
-  is checked to return exactly what the agent's own method returns. Both run
-  unattended, with one LLM by default as in the paper.
+- **Three run modes, every one producing every paper artifact.** After the
+  main comparison, each mode runs the *paper experiments* on one LLM (as in the
+  paper; Llama by default): the three prompted sensitivity levels for Table 8
+  (b), and λ = (0.1, 0.9), (0.5, 0.5), (0.9, 0.1) for Table 9. The deployed
+  λ = (0.3, 0.7) row is taken from the main run on the same sessions, not run
+  twice. Table 9 is skipped, with the reason stated, in Scenarios B and D,
+  where memory is off. The sensitivity sentence is added to the Stage 2
+  question on the agent *instance* only, and the λ retriever replaces the
+  method on the instance only; the agent module is untouched, and at (0.3, 0.7)
+  the λ retriever is checked to return exactly what the agent's own method
+  returns. The experiments run unattended and refuse to start if memory cannot
+  retrieve anything. Answer `n` at the prompt for a quick run without them.
+- **A checklist of the paper's artifacts** ends every run: Tables 6/7, 8 (a),
+  8 (b), 9 and 10, Figures 7 and 8, each marked present or given a reason.
+
+### Incomplete agents and completing a run
+
+An agent with fewer than 90% of the sessions the most complete agent has is
+**set aside**: reported in `table_incomplete_agents` (sessions reached, LLM
+error rate, projected hours for a full run) and excluded from every
+comparative table. Previously one model stopped early shrank every table to
+the sessions it reached — a run with Llama 100, Qwen 100 and GLM 5 produced
+paper tables over n = 5, discarding 95 of the complete models' 100 sessions.
+The console comparison follows the same rule.
+
+To complete that model later without repeating the others, choose
+`Models to run: glm` with the **same** scenario, XAI setting, sampling design,
+seed and sample size, and give the earlier results file when asked. The paper
+tables then merge the two files, taking each model from the file in which it
+completed most sessions. By hand:
+
+```
+python paper_metrics_v32.py earlier.json glm_only.json --merge
+```
+
+A merge is refused if the files cover different sessions.
+
+### RAG in Scenarios A and B
+
+With no vector store — a ChromaDB collection `ev_security_knowledge` under
+`knowledge_base/` — the RAG step inserts a fixed built-in domain-knowledge text
+chosen by the delivery ratio. That text does reach the prompt, but nothing is
+retrieved, so the provenance table reports 0 passages and says so. Describe it
+in the paper as static domain knowledge, or build the knowledge base, before
+claiming retrieval-augmented generation.
 
 ## 1. The GLM problem, and what it actually was
 

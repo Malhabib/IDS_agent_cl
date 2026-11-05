@@ -74,7 +74,7 @@ from ev_ids_agent_v6_triple_llm_v32 import (
     parse_datetime_to_timestamp, SHAP_AVAILABLE, LIME_AVAILABLE,
     NUM_CTX, min_viable_num_ctx, _env_num, LLM_TEMPERATURE
 )
-from paper_metrics_v32 import generate_paper_outputs
+from paper_metrics_v32 import generate_paper_outputs, COMPLETE_FRACTION
 
 PRINT_LOCK = threading.Lock()
 
@@ -739,18 +739,27 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
                  'Gradient Boosting': 'GB'}
     ml_names = list(model_map.keys())
 
+    # Models that completed the run. One stopped early (e.g. by the circuit
+    # breaker) must not shrink the shared tables to the few sessions it reached.
+    full = max(counts.values())
+    by_name = {'Llama': results_llama, 'Qwen': results_qwen, 'GLM': results_glm}
+    complete = OrderedDict((n, r) for n, r in by_name.items()
+                           if len(r) >= COMPLETE_FRACTION * full)
+    stopped = [n for n in by_name if n not in complete]
     if ragged:
-        common = _common_indices(results_llama, results_qwen, results_glm)
+        common = _common_indices(*complete.values())
         print(f"\n  [INCOMPLETE RUN] The three models did not complete the same "
               f"number of sessions:")
         for nm, c in counts.items():
-            print(f"      {nm:<6} {c:>5}")
+            print(f"      {nm:<6} {c:>5}" + ("   <- stopped early, excluded from "
+                                            "shared tables" if nm in stopped else ""))
         print(f"  Each model's own accuracy below is computed over the sessions IT")
-        print(f"  completed. Paired comparisons (McNemar, kappa) and the zone table")
-        print(f"  use the {len(common)} sessions all three share, since a paired test")
-        print(f"  across different sessions measures nothing. A model with far fewer")
-        print(f"  sessions is not comparable to the others and must not be reported")
-        print(f"  as though it were — re-run it before drawing any conclusion.")
+        print(f"  completed. Paired tests use the sessions each pair shares; the")
+        print(f"  zone table uses the {len(common)} sessions the complete models share.")
+        if stopped:
+            print(f"  {', '.join(stopped)} did not complete the run and must not be")
+            print(f"  reported alongside the others. Complete it by re-running that")
+            print(f"  model alone and merging (see 'Models to run' in the menu).")
 
     ground_truths = _ground_truths(results_llama)
     llama_preds   = {n: [r['model_predictions'].get(n, {}).get('prediction', 'Normal')
@@ -941,31 +950,37 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
     # all three completed. Positional indexing into a shorter model's list was
     # the second way a truncated run went wrong: it silently compared Qwen's
     # session 3 against Llama's session 3 by POSITION, not by session id.
-    shared_idx = _common_indices(results_llama, results_qwen, results_glm)
-    zone_rows  = _restrict(results_llama, shared_idx)
+    shared_idx = _common_indices(*complete.values())
+    ref_rows   = next(iter(complete.values()))
+    zone_rows  = _restrict(ref_rows, shared_idx)
     if ragged:
-        print(f"  (restricted to the {len(shared_idx)} sessions all three models "
-              f"completed)")
+        print(f"  (restricted to the {len(shared_idx)} sessions the complete models "
+              f"share" + (f"; {', '.join(stopped)} excluded" if stopped else "") + ")")
     for zone in sorted(zones.keys()):
         zone_ids = [r['index'] for r in zone_rows
                     if r['result'].get('difficulty_zone') == zone]
         if not zone_ids:
             continue
-        zone_gt  = _ground_truths(_restrict(results_llama, zone_ids))
+        zr       = _restrict(ref_rows, zone_ids)
+        zone_gt  = _ground_truths(zr)
         zone_accs = {}
-        for lname, results in [('Llama', results_llama), ('Qwen', results_qwen), ('GLM', results_glm)]:
+        for lname, results in by_name.items():
+            if lname not in complete:
+                zone_accs[lname] = None
+                continue
             zp = [r['predicted'] for r in _restrict(results, zone_ids)]
             zone_accs[lname] = sum(a == b for a, b in zip(zone_gt, zp)) / len(zone_gt)
-        pos = {r['index']: i for i, r in enumerate(results_llama)}
-        zone_idx  = [pos[i] for i in zone_ids]
-        maj_preds = [llama_preds['Majority_Vote'][i] for i in zone_idx]
+        # The classifiers are identical across agents for a session, so their
+        # predictions are read from the reference rows directly.
+        maj_preds = [r['majority_vote'] for r in zr]
         zone_accs['Majority'] = sum(a == b for a, b in zip(zone_gt, maj_preds)) / len(zone_gt)
         zone_accs['Best ML']  = max(
-            sum(a == b for a, b in zip(zone_gt, [llama_preds[mn][i] for i in zone_idx])) / len(zone_gt)
-            for mn in ml_names
-        )
-        print(f"  {zone:<20} | {zone_accs['Llama']:>8.4f} | {zone_accs['Qwen']:>8.4f} | "
-              f"{zone_accs['GLM']:>8.4f} | {zone_accs['Majority']:>8.4f} | {zone_accs['Best ML']:>8.4f}")
+            sum(a == b for a, b in zip(zone_gt, [r['model_predictions'].get(mn, {})
+                                               .get('prediction', 'Normal') for r in zr]))
+            / len(zone_gt) for mn in ml_names)
+        cell = lambda v: f"{v:>8.4f}" if v is not None else f"{'n/a':>8}"
+        print(f"  {zone:<20} | {cell(zone_accs['Llama'])} | {cell(zone_accs['Qwen'])} | "
+              f"{cell(zone_accs['GLM'])} | {cell(zone_accs['Majority'])} | {cell(zone_accs['Best ML'])}")
 
     # COMPLEXITY
     print(f"\n{'='*120}")
@@ -1578,35 +1593,65 @@ RUN MODE
   2) temperature — sweep decoding temperature across all LLMs and report
                    "Effect of temperature on accuracy across LLM models"
   3) both        — standard run, then the temperature sweep
-  4) sensitivity — paper Table 8, option (b): re-run with the paper's
-                   prompt instruction at aggressive / balanced / conservative
-  5) lambda      — paper Table 9: re-run with the long-term-memory weights
-                   lambda1 (recency) / lambda2 (similarity). Needs LTM on.
 
-  Every mode ends by writing the paper tables and figures, including
-  Table 8 option (a): post-hoc sensitivity from the run itself, at no
-  extra cost. Modes 4 and 5 skip the standard three-model run.
+  Every mode produces ALL the paper tables and figures (IDS-Agent paper
+  numbering): Tables 6/7, 8, 9 and 10, Figures 7 and 8, plus the
+  robustness metrics. Table 8 (prompted) and Table 9 need their own runs;
+  they are part of every mode, on one LLM as in the paper.
 """)
-    run_mode = input("  Mode (1/2/3/4/5) [1]: ").strip() or "1"
-    paper_slots = ['llama']
-    paper_settings = None
-    if run_mode in ("4", "5"):
-        print("\n  The paper ran its sensitivity and lambda tables with one LLM.")
-        raw = input("  Models to sweep (llama,glm,qwen) [llama]: ").strip().lower()
+    run_mode = input("  Mode (1/2/3) [1]: ").strip() or "1"
+    if run_mode not in ("1", "2", "3"):
+        run_mode = "1"
+
+    # ── WHICH MODELS ────────────────────────────────────────────────────────
+    # Normally all three. Running a subset is how an agent the circuit breaker
+    # stopped early is completed later WITHOUT repeating the models that
+    # already finished; the earlier results file is merged at the end.
+    run_slots = ['llama', 'glm', 'qwen']
+    merge_with = None
+    raw = input("\n  Models to run (llama,glm,qwen) [all]: ").strip().lower()
+    if raw:
+        run_slots = [x.strip() for x in raw.split(',')
+                     if x.strip() in ('llama', 'glm', 'qwen')] or run_slots
+    if len(run_slots) < 3:
+        print(f"  Running only: {', '.join(run_slots)}.")
+        print("  To complete an earlier run, give its results file: the paper tables")
+        print("  will combine both. The SAME scenario, XAI setting, sampling design,")
+        print("  seed and sample size must be chosen, or the merge is refused.")
+        raw = input("  Earlier results JSON to merge with (Enter to skip): ").strip().strip('"')
         if raw:
-            paper_slots = [s.strip() for s in raw.split(',')
-                           if s.strip() in ('llama', 'glm', 'qwen')] or ['llama']
-        if run_mode == "4":
-            paper_settings = list(SENSITIVITY_DETAILS)
+            if os.path.exists(raw):
+                merge_with = raw
+            else:
+                print(f"  Not found: {raw} -- continuing without a merge.")
+
+    # ── PAPER EXPERIMENTS: Table 8 (prompted) and Table 9 ──────────────────
+    paper_exp = input("\n  Run the paper experiments for Table 8 (prompted sensitivity)"
+                      "\n  and Table 9 (memory lambda1/lambda2)? (Y/n): ").strip().lower() != 'n'
+    paper_slot, paper_n, paper_lambdas = 'llama', None, []
+    if paper_exp:
+        raw = input("  Model for these experiments (llama/glm/qwen) [llama]: ").strip().lower()
+        if raw in ('llama', 'glm', 'qwen'):
+            paper_slot = raw
+        if use_memory:
+            paper_lambdas = [lam for lam in PAPER_LAMBDAS if lam != AGENT_LTM_LAMBDA]
         else:
-            if not use_memory:
-                print("\n  [ABORT] The lambda sweep varies how long-term memory is "
-                      "retrieved,\n  so it needs a scenario with LTM on (A or C). "
-                      "Re-run and choose A or C.")
-                return
-            paper_settings = list(PAPER_LAMBDAS)
-        print(f"  Sweep: {len(paper_slots)} model(s) x {len(paper_settings)} settings "
-              f"= {len(paper_slots) * len(paper_settings)} full runs, workers=1")
+            print("  Table 9 skipped: it varies long-term-memory retrieval, and memory")
+            print("  is OFF in this scenario (choose A or C to produce it).")
+        raw = input("  Sessions per setting (Enter = all sessions of the main run): ").strip()
+        try:
+            paper_n = int(raw) if raw else None
+        except ValueError:
+            paper_n = None
+        n_settings = len(SENSITIVITY_DETAILS) + len(paper_lambdas)
+        print(f"  Paper experiments: {n_settings} extra runs of {paper_slot}"
+              f" ({len(SENSITIVITY_DETAILS)} sensitivity"
+              + (f" + {len(paper_lambdas)} lambda" if paper_lambdas else "")
+              + "), each on the same sessions. Each costs about as much as that model's")
+        print("  share of the main run; the time per session is reported once it is known.")
+        if paper_lambdas:
+            print(f"  The lambda=({AGENT_LTM_LAMBDA[0]:g}, {AGENT_LTM_LAMBDA[1]:g}) row is the main run "
+                  f"itself, so it is not run twice.")
     temps = [0.0, 0.2, 0.5, 0.7, 1.0]
     if run_mode in ("2", "3"):
         raw = input(f"  Temperatures (comma separated) {temps}: ").strip()
@@ -1743,54 +1788,30 @@ RUN MODE
         'self_consistency_k': sc_k,
     }
 
-    # PAPER EXPERIMENT MODES — run the sweep only, then write the paper outputs.
-    if run_mode in ("4", "5"):
-        kind  = 'sensitivity' if run_mode == "4" else 'lambda'
-        files = run_paper_sweep(kind, paper_settings, paper_slots, config, backend,
-                                base_url, scenario_tag, use_knowledge, use_memory,
-                                use_xai, shared_store, selected, df, model_ids,
-                                results_dir, sc_k, train_indices, base_meta)
+    # RUN THE SELECTED MODELS. A model not selected keeps an empty result; the
+    # comparison and the paper tables handle that, and an earlier results file
+    # can supply it through the merge.
+    def run_slot(slot, label, previous):
+        if slot not in run_slots:
+            return []
+        if backend == 'ollama' and previous:
+            unload_ollama_model(previous, base_url)   # free VRAM for this model
+        print(f"\nMANUAL: make sure {model_ids[slot]} is available on the backend")
+        agent = make_agent(model_ids[slot])
+        if use_memory and agent.ltm:
+            agent.ltm.clear()
+            agent.seed_ltm_from_training(train_indices, n_seed=50)
+        rows = run_classification(agent, f"[{slot.upper()}]", label,
+                                  selected, df, workers=workers)
         shared_store.save()
-        if files:
-            _write_paper_outputs(files, results_dir)
-        print(f"\nTRIPLE LLM V32 {kind.upper()} SWEEP COMPLETE "
-              f"({len(files)} run(s) saved)\n")
-        return
+        return rows
 
-    # RUN LLAMA
-    print(f"\nMANUAL: make sure {model_ids['llama']} is available on the backend")
-    agent_llama = make_agent(model_ids["llama"])
-    if use_memory and agent_llama.ltm:
-        agent_llama.ltm.clear()
-        agent_llama.seed_ltm_from_training(train_indices, n_seed=50)
-    results_llama = run_classification(agent_llama, "[LLAMA]", "LLAMA3",
-                                        selected, df, workers=workers)
-    shared_store.save()
-
-    # RUN GLM — free the previous model's VRAM first so GLM gets the whole GPU
-    if backend == 'ollama':
-        unload_ollama_model(model_ids["llama"], base_url)
-    print(f"\nMANUAL: switch to {model_ids['glm']}")
-    agent_glm = make_agent(model_ids["glm"])
-    if use_memory and agent_glm.ltm:
-        agent_glm.ltm.clear()
-        agent_glm.seed_ltm_from_training(train_indices, n_seed=50)
-    results_glm = run_classification(agent_glm, "[GLM]",
-                                      model_ids['glm'].split(':')[0].upper(),
-                                      selected, df, workers=workers)
-    shared_store.save()
-
-    # RUN QWEN — free the previous model's VRAM first
-    if backend == 'ollama':
-        unload_ollama_model(model_ids["glm"], base_url)
-    print(f"\nMANUAL: switch to {model_ids['qwen']}")
-    agent_qwen = make_agent(model_ids["qwen"])
-    if use_memory and agent_qwen.ltm:
-        agent_qwen.ltm.clear()
-        agent_qwen.seed_ltm_from_training(train_indices, n_seed=50)
-    results_qwen = run_classification(agent_qwen, "[QWEN]", "QWEN3.5",
-                                       selected, df, workers=workers)
-    shared_store.save()
+    results_llama = run_slot('llama', "LLAMA3", None)
+    results_glm   = run_slot('glm', model_ids['glm'].split(':')[0].upper(),
+                             model_ids['llama'] if 'llama' in run_slots else None)
+    results_qwen  = run_slot('qwen', "QWEN3.5",
+                             model_ids['glm'] if 'glm' in run_slots
+                             else model_ids['llama'] if 'llama' in run_slots else None)
 
     # SAVE FIRST. The results used to be written only after the comparison
     # printed, and not at all if any model came back empty -- so a crash in
@@ -1828,20 +1849,95 @@ RUN MODE
               f"completed models are saved and analysed below.")
 
     paper_inputs = [results_file] if saved else []
+    if merge_with:
+        paper_inputs.append(merge_with)
     if run_mode in ("2", "3"):
         _, sweep_file = run_temperature_sweep(config, backend, base_url, scenario_tag,
                                               use_knowledge, use_memory, shared_store,
-                                              selected[:sweep_n], df, temps, model_ids,
+                                              selected[:sweep_n], df, temps,
+                                              {k: model_ids[k] for k in run_slots},
                                               results_dir, sc_k, use_xai=use_xai)
         if sweep_file:
             paper_inputs.append(sweep_file)
 
+    # PAPER EXPERIMENTS — Table 8 (prompted sensitivity) and Table 9 (lambda).
+    if paper_exp:
+        main_rows = {'llama': results_llama, 'glm': results_glm, 'qwen': results_qwen}
+        paper_inputs += run_paper_experiments(
+            paper_slot, paper_n, paper_lambdas, main_rows[paper_slot], config,
+            backend, base_url, scenario_tag, use_knowledge, use_memory, use_xai,
+            shared_store, selected, df, model_ids, results_dir, sc_k,
+            train_indices, base_meta)
+
     if paper_inputs:
-        _write_paper_outputs(paper_inputs, results_dir)
+        _write_paper_outputs(paper_inputs, results_dir, merge=bool(merge_with))
     print(f"\nTRIPLE LLM V32 SCENARIO {choice} COMPLETE!\n")
 
 
-def _write_paper_outputs(files, results_dir):
+def run_paper_experiments(slot, n, lambdas, main_rows, config, backend, base_url,
+                          scenario_tag, use_knowledge, use_memory, use_xai,
+                          shared_store, selected, df, model_ids, results_dir, sc_k,
+                          train_indices, base_meta):
+    """
+    The extra runs behind the paper's Table 8 (b) and Table 9, on one model.
+
+    The lambda = (0.3, 0.7) row is the deployed configuration, which the main
+    run has just measured on the same sessions, so it is taken from the main
+    run instead of being run a second time. Restricting the main run to the
+    first n sessions is equivalent to running those n alone: memory is seeded
+    identically and accumulates in the same order.
+    """
+    sel = list(selected if not n else selected[:n])
+    times = [float(r['result'].get('complexity', {}).get('session_total_sec', 0) or 0)
+             for r in (main_rows or [])]
+    runs_needed = len(SENSITIVITY_DETAILS) + len(lambdas) + (0 if main_rows else 1 if lambdas else 0)
+    print(f"\n{'='*120}\nPAPER EXPERIMENTS — {slot}: Table 8 (prompted sensitivity)"
+          + (" and Table 9 (lambda)" if lambdas else "") + f", {len(sel)} sessions each"
+          f"\n{'='*120}")
+    if times:
+        per = float(np.mean(times))
+        print(f"  Measured {per:.0f} s per session for {slot} in the main run: "
+              f"{runs_needed} runs x {len(sel)} sessions = about "
+              f"{per * runs_needed * len(sel) / 3600:.1f} h.")
+
+    files = run_paper_sweep('sensitivity', list(SENSITIVITY_DETAILS), [slot], config,
+                            backend, base_url, scenario_tag, use_knowledge, use_memory,
+                            use_xai, shared_store, sel, df, model_ids, results_dir,
+                            sc_k, train_indices, base_meta)
+    if lambdas:
+        lam_settings = list(lambdas) + ([] if main_rows else [AGENT_LTM_LAMBDA])
+        lam_files = run_paper_sweep('lambda', lam_settings, [slot], config, backend,
+                                    base_url, scenario_tag, use_knowledge, use_memory,
+                                    use_xai, shared_store, sel, df, model_ids,
+                                    results_dir, sc_k, train_indices, base_meta)
+        files += lam_files
+        if lam_files and main_rows:
+            files.append(_reference_lambda_file(slot, main_rows, sel, results_dir,
+                                                scenario_tag, base_meta))
+    shared_store.save()
+    return files
+
+
+def _reference_lambda_file(slot, main_rows, sel, results_dir, scenario_tag, base_meta):
+    """Table 9's default-lambda row, taken from the main run on the same sessions."""
+    by = {r['index']: r for r in main_rows}
+    rows = [by[i] for i in sel if i in by]
+    meta = dict(base_meta)
+    meta.update({'sensitivity': 'none', 'ltm_lambda': list(AGENT_LTM_LAMBDA),
+                 'ltm_lambda_sweep': True, 'reused_from_main_run': True,
+                 'results_llama': [], 'results_glm': [], 'results_qwen': []})
+    meta[f'results_{slot}'] = rows
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(results_dir, f"triple_llm_v6_v32_{scenario_tag}_lambda_{slot}_"
+                                     f"lam{AGENT_LTM_LAMBDA[0]:g}-{AGENT_LTM_LAMBDA[1]:g}"
+                                     f"_from_main_{ts}.json")
+    with open(path, 'w') as f:
+        json.dump(make_json_serializable(meta), f, indent=2)
+    print(f"  Saved (from the main run): {path}")
+    return path
+
+
+def _write_paper_outputs(files, results_dir, merge=False):
     """
     Paper tables and figures for this run. Never allowed to fail the run: the
     results JSON is already on disk, and the same outputs can be regenerated
@@ -1851,13 +1947,15 @@ def _write_paper_outputs(files, results_dir):
     try:
         out = generate_paper_outputs(
             files, out_dir=os.path.join(results_dir, 'paper',
-                                        datetime.now().strftime('%Y%m%d_%H%M%S')))
+                                        datetime.now().strftime('%Y%m%d_%H%M%S')),
+            merge=merge)
         if out:
             print(f"  Index of every table and figure: {os.path.join(out, 'README.md')}")
     except Exception:
         import traceback
         print("  [PAPER METRICS ERROR] The results are saved; regenerate with:")
-        print(f"      python paper_metrics_v32.py {' '.join(files)}")
+        print(f"      python paper_metrics_v32.py {' '.join(files)}"
+              + (" --merge" if merge else ""))
         traceback.print_exc()
 
 

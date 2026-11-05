@@ -61,6 +61,11 @@ AGENT_KEYS = ('llama', 'qwen', 'glm')
 
 EASY_ZONES = {'EASY_NORMAL', 'EASY_ATTACK'}
 
+# An agent counts as having completed a run if it has at least this share of
+# the sessions the most complete agent has. Below it, the agent is reported
+# separately and kept out of every comparative table.
+COMPLETE_FRACTION = 0.9
+
 # Default LTM weights. The agent hard-codes 0.3*recency + 0.7*similarity in
 # LongTermMemory.retrieve_similar; runs that do not record a lambda used these.
 DEFAULT_LTM_LAMBDA = (0.3, 0.7)
@@ -98,11 +103,37 @@ class Run:
         self.path = path
         self.meta = {k: v for k, v in data.items() if not k.startswith('results_')}
         llms = data.get('llms') or {}
-        self.agents: "OrderedDict[str, List[Dict]]" = OrderedDict()
+        self.keys: Dict[str, str] = {}          # pretty name -> 'llama' / 'glm' / 'qwen'
+        self.all_agents: "OrderedDict[str, List[Dict]]" = OrderedDict()
         for key in AGENT_KEYS:
             rows = data.get(f'results_{key}') or []
             if rows:
-                self.agents[pretty_model(llms.get(key, ''), key)] = rows
+                name = pretty_model(llms.get(key, ''), key)
+                self.all_agents[name] = rows
+                self.keys[name] = key
+        self._split()
+
+    def _split(self):
+        """
+        Separate agents that completed the run from agents that did not.
+
+        Comparative tables must use sessions every compared agent completed.
+        An agent the circuit breaker stopped early would otherwise shrink EVERY
+        table to the few sessions it reached: a run with Llama 100, Qwen 100 and
+        GLM 5 produced paper tables over n=5, discarding 95 of the 100 sessions
+        the two complete models had paid for. An agent with fewer than
+        COMPLETE_FRACTION of the largest session count is therefore reported on
+        its own and left out of the comparisons.
+        """
+        if not self.all_agents:
+            self.agents, self.incomplete = OrderedDict(), OrderedDict()
+            return
+        most = max(len(rows) for rows in self.all_agents.values())
+        self.expected_n = most
+        self.agents = OrderedDict((n, r) for n, r in self.all_agents.items()
+                                  if len(r) >= COMPLETE_FRACTION * most)
+        self.incomplete = OrderedDict((n, r) for n, r in self.all_agents.items()
+                                      if n not in self.agents)
 
     # Grouping keys -----------------------------------------------------------
     @property
@@ -863,14 +894,98 @@ def table_integrity(run: Run, idx) -> Table:
             notes.append(f"WARNING: memory is ON for {r[0]} but no session retrieved "
                          f"a case. Memory was not live; treat this run as memory-off.")
         if r[10] == 'on' and r[12].startswith('0/'):
-            notes.append(f"WARNING: RAG is ON for {r[0]} but no session retrieved a "
-                         f"passage. RAG was not live.")
+            notes.append(f"NOTE: RAG is ON for {r[0]} but no session retrieved a "
+                         f"document. With no vector store (a ChromaDB collection "
+                         f"'ev_security_knowledge' under knowledge_base/), the agent "
+                         f"inserts a fixed built-in domain-knowledge text instead. "
+                         f"The knowledge reached the prompt, but it was not "
+                         f"retrieval-augmented: describe it as static domain "
+                         f"knowledge, or build the knowledge base.")
     return Table('table_provenance_and_retrieval',
                  f"Decision provenance and retrieval usage, Scenario {run.letter}",
                  ['Agent', 'n', 'Stated', 'Repaired', 'ML fallback', 'LLM error',
                   'Format compliance', 'LTM', 'LTM cases/session',
                   'Sessions with LTM', 'RAG', 'RAG passages/session',
                   'Sessions with RAG'], rows, notes)
+
+
+def table_incomplete(run: Run) -> Optional[Table]:
+    """
+    Agents that stopped early, measured on the sessions they DID complete.
+
+    They are listed here, not silently dropped, so it is visible that a model
+    was attempted and why it has no row in the comparative tables.
+    """
+    if not run.incomplete:
+        return None
+    rows = []
+    notes = [f"Excluded from every comparative table: fewer than "
+             f"{COMPLETE_FRACTION:.0%} of the {run.expected_n} sessions the other "
+             f"agents completed. Figures here describe a handful of sessions and "
+             f"must not be compared with the complete agents."]
+    for name, rr in run.incomplete.items():
+        v = agent_view(rr)
+        m = binary_metrics(v['y'], v['yhat'])
+        err = llm_error_rate(rr)
+        secs = [float(r['result'].get('complexity', {}).get('session_total_sec', 0) or 0)
+                for r in rr]
+        mean_s = float(np.mean(secs)) if secs else float('nan')
+        full_h = mean_s * run.expected_n / 3600 if secs else float('nan')
+        rows.append([name, f"{len(rr)}/{run.expected_n}", err['errors'],
+                     _fmt(err['rate'], 2), _fmt(m['accuracy'], 3),
+                     _fmt(mean_s, 0), _fmt(full_h, 1)])
+        if err['rate'] > 0.2:
+            notes.append(
+                f"{name}: {err['errors']} of {len(rr)} sessions got no answer from the "
+                f"model ({err['rate']:.0%}). The run's circuit breaker stops a model "
+                f"when more than 20% of its sessions go unanswered, because those "
+                f"sessions would be labelled by the ML majority, not the model. At "
+                f"{mean_s:.0f} s per session the calls are running past the per-call "
+                f"deadline: the model is too large for this GPU and is running "
+                f"largely on the CPU.")
+    return Table('table_incomplete_agents',
+                 f"Agents that did not complete the run, Scenario {run.letter}",
+                 ['Agent', 'Sessions', 'LLM errors', 'Error rate',
+                  'Acc (own sessions)', 'Mean s/session', 'Projected h for all'],
+                 rows, notes)
+
+
+def table_execution_time(run: Run, idx) -> Table:
+    """
+    Paper Table 10: average execution time per instance.
+
+    The paper compares its agent with an in-context GPT-4 baseline. Here the
+    baseline is this framework without its LLM: preprocessing, the seven
+    classifiers, SHAP/LIME and retrieval, i.e. a session's total time minus the
+    time spent in LLM calls. SHAP/LIME are computed once per session and cached
+    for later models, so the non-LLM time is taken as the largest across models
+    for each session -- the one that paid for the explanations.
+    """
+    non_llm, totals = [], OrderedDict()
+    by = {n: {r['index']: r for r in rows} for n, rows in run.agents.items()}
+    for i in idx:
+        cands = []
+        for n in by:
+            c = by[n][i]['result'].get('complexity', {}) or {}
+            tot = float(c.get('session_total_sec', 0) or 0)
+            llm = float(c.get('llm_latency_sec', 0) or 0)
+            cands.append(max(0.0, tot - llm))
+            totals.setdefault(n, []).append(tot)
+        non_llm.append(max(cands) if cands else 0.0)
+    heads = ['', 'ML ensemble + XAI (no LLM)'] + [f"{n} Agent" for n in totals]
+    mean_row = ['Average time per instance (s)', _fmt(float(np.mean(non_llm)), 2)]
+    med_row = ['Median time per instance (s)', _fmt(float(np.median(non_llm)), 2)]
+    tot_row = ['Total for the run (h)', _fmt(float(np.sum(non_llm)) / 3600, 2)]
+    for n, t in totals.items():
+        mean_row.append(_fmt(float(np.mean(t)), 2))
+        med_row.append(_fmt(float(np.median(t)), 2))
+        tot_row.append(_fmt(float(np.sum(t)) / 3600, 2))
+    return Table('table10_execution_time',
+                 f"Execution time per instance (Scenario {run.letter}, n={len(idx)}). "
+                 f"Paper Table 10 layout.", heads, [mean_row, med_row, tot_row],
+                 ["The no-LLM column is each session's total time minus its LLM "
+                  "calls: preprocessing, seven classifiers, SHAP/LIME and retrieval.",
+                  "Times depend on the hardware the run used; report it with the table."])
 
 
 def table_xai(run: Run, idx) -> Table:
@@ -1005,6 +1120,38 @@ def figure_confidence_distributions(run: Run, idx, out_dir, split: str) -> List[
                  f"is available in this dataset", fontsize=10)
     fig.tight_layout(rect=[0, 0, 1, 0.98])
     paths = _save(fig, out_dir, f"figure8_confidence_by_{split}")
+    plt.close(fig)
+    return paths
+
+
+def figure_confusion(run: Run, idx, systems, out_dir) -> List[str]:
+    """
+    Paper Figure 7: confusion matrix of the majority-voting classifier and of
+    the IDS agent, one panel each, on the same sessions.
+    """
+    plt = _plt()
+    panels = [('Majority Vote', systems['Majority Vote'][1])]
+    panels += [(k, v) for k, (kind, v) in systems.items() if kind == 'agent']
+    fig, axes = plt.subplots(1, len(panels), figsize=(3.6 * len(panels), 3.6))
+    axes = np.atleast_1d(axes)
+    letters = 'abcdefgh'
+    for ax, (letter, (name, v)) in zip(axes, zip(letters, panels)):
+        m = binary_metrics(v['y'], v['yhat'])
+        cm = np.array([[m['tn'], m['fp']], [m['fn'], m['tp']]])
+        ax.imshow(cm, cmap='Blues', vmin=0, vmax=max(1, cm.max()))
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i, str(cm[i, j]), ha='center', va='center', fontsize=13,
+                        color='white' if cm[i, j] > cm.max() / 2 else 'black')
+        ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+        ax.set_xticklabels(['Normal', 'Attack']); ax.set_yticklabels(['Normal', 'Attack'])
+        ax.set_xlabel('Predicted'); ax.set_ylabel('Actual')
+        ax.set_title(f"({letter}) {name}\nAcc={m['accuracy']:.3f}  F1={m['f1']:.3f}",
+                     fontsize=9)
+    fig.suptitle(f"Confusion matrices of the majority-voting classifier and the IDS "
+                 f"agents (Scenario {run.letter}, n={len(idx)})", fontsize=10)
+    fig.tight_layout()
+    paths = _save(fig, out_dir, 'figure7_confusion_matrices')
     plt.close(fig)
     return paths
 
@@ -1182,7 +1329,8 @@ def table_lambda(runs: List[Run]) -> List[Table]:
             m = _agent_metrics(r, name)
             ltm = [int(x['result'].get('ltm_cases_referenced', 0) or 0)
                    for x in r.agents[name]]
-            rows.append([f"{r.ltm_lambda[0]:g}", f"{r.ltm_lambda[1]:g}",
+            star = '*' if r.meta.get('reused_from_main_run') else ''
+            rows.append([f"{r.ltm_lambda[0]:g}{star}", f"{r.ltm_lambda[1]:g}",
                          f"{100 * m['accuracy']:.1f}", f"{100 * m['macro_precision']:.1f}",
                          f"{100 * m['macro_recall']:.1f}", f"{100 * m['macro_f1']:.1f}",
                          m['n'], f"{sum(1 for x in ltm if x > 0)}/{len(ltm)}"])
@@ -1192,6 +1340,9 @@ def table_lambda(runs: List[Run]) -> List[Table]:
         notes = ["λ1 weights recency and λ2 cosine similarity in long-term-memory "
                  "retrieval (paper Eq. 1). Precision and recall are macro-averaged.",
                  f"Default in V32: λ1={DEFAULT_LTM_LAMBDA[0]:g}, λ2={DEFAULT_LTM_LAMBDA[1]:g}."]
+        if any(r[0].endswith('*') for r in rows):
+            notes.append("* the deployed setting, taken from the main run on the same "
+                         "sessions rather than run a second time.")
         if all(row[-1].startswith('0/') for row in rows):
             notes.append("WARNING: no session retrieved a memory case in any setting, "
                          "so λ cannot have had an effect. The memory was not live.")
@@ -1270,19 +1421,27 @@ def analyse_run(run: Run, out_dir: str, n_boot: int, source: str, tau: float,
     cal, curves = table_calibration(run, idx, systems)
     tables += [cal]
     tables += table_sensitivity_posthoc(run, idx, source, tau)
-    tables += [table_zones(run, idx), table_efficiency(run, idx),
-               table_integrity(run, idx), table_xai(run, idx)]
+    tables += [table_execution_time(run, idx), table_zones(run, idx),
+               table_efficiency(run, idx), table_integrity(run, idx),
+               table_xai(run, idx)]
+    inc = table_incomplete(run)
+    if inc:
+        tables.append(inc)
+        print(f"  [INCOMPLETE] {', '.join(f'{n} ({len(r)}/{run.expected_n})' for n, r in run.incomplete.items())} "
+              f"stopped early and is reported separately; the comparative tables "
+              f"use the {len(idx)} sessions the complete agents share.")
 
     counts = {n: len(rws) for n, rws in run.agents.items()}
     if len(set(counts.values())) > 1:
-        print(f"  [note] agents completed different numbers of sessions {counts}; "
-              f"every table uses the {len(idx)} sessions all of them share.")
+        print(f"  [note] complete agents differ slightly in sessions {counts}; "
+              f"comparative tables use the {len(idx)} sessions they share.")
     for t in tables:
         written['tables'] += t.write(tdir)
         if verbose:
             print(t.text())
 
-    for fn, args in ((figure_confidence_distributions, (run, idx, fdir, 'zone')),
+    for fn, args in ((figure_confusion, (run, idx, systems, fdir)),
+                     (figure_confidence_distributions, (run, idx, fdir, 'zone')),
                      (figure_confidence_distributions, (run, idx, fdir, 'correct')),
                      (figure_roc_pr, (run, systems, fdir)),
                      (figure_calibration, (run, curves, fdir))):
@@ -1294,9 +1453,98 @@ def analyse_run(run: Run, out_dir: str, n_boot: int, source: str, tau: float,
     return written
 
 
+def paper_checklist(runs: List[Run], produced: List[str]) -> List[Tuple[str, bool, str]]:
+    """Which of the IDS-Agent paper's tables and figures exist, and why not."""
+    def has(prefix):
+        return any(p.startswith(prefix) for p in produced)
+    std = [r for r in runs if r.is_standard]
+    any_ltm = any(r.meta.get('use_memory') for r in runs)
+    enable = "enable 'paper experiments' in the runner (default Yes)"
+    items = [
+        ('Tables 6/7 (per-class F)', has('table6_'), 'table6_per_class_fscore'),
+        ('Table 8 (a) post-hoc', has('table8a_'), 'table8a_sensitivity_posthoc_*'),
+        ('Table 8 (b) prompted', has('table8b_'),
+         'table8b_sensitivity_prompted_*' if has('table8b_')
+         else f'no prompted-sensitivity runs in the inputs; {enable}'),
+        ('Table 9 (LTM λ1/λ2)', has('table9_'),
+         'table9_ltm_lambda_*' if has('table9_')
+         else ('memory (LTM) is off in this scenario; Table 9 varies memory '
+               'retrieval and needs Scenario A or C' if std and not any_ltm
+               else f'no λ runs in the inputs; {enable}')),
+        ('Table 10 (execution time)', has('table10_'), 'table10_execution_time'),
+        ('Figure 7 (confusion)', has('figure7_'), 'figure7_confusion_matrices'),
+        ('Figure 8 (confidence)', has('figure8_'),
+         'figure8_confidence_by_zone / _by_correct (not out-of-distribution)'),
+    ]
+    return items
+
+
+def merge_runs(runs: List[Run], out_dir: str) -> Tuple[List[Run], List[str]]:
+    """
+    Combine standard runs of the SAME experiment that were run in parts.
+
+    A model the circuit breaker stopped early can be re-run on its own, without
+    repeating the models that already finished -- the Llama and Qwen sessions of
+    a 100-session run cost about 30 hours. Files are merged when they share the
+    scenario, the XAI setting and the sampling seed; each agent is taken from
+    the file in which it completed the most sessions.
+
+    Merging is refused if the files do not cover the same sessions (different
+    sampling design or sample size): their agents would be compared on
+    different data, and paired statistics would be meaningless.
+    """
+    msgs, out, groups = [], [], OrderedDict()
+    for r in runs:
+        if r.is_standard:
+            groups.setdefault((r.letter, r.xai, r.seed), []).append(r)
+        else:
+            out.append(r)
+    for key, grp in groups.items():
+        if len(grp) == 1:
+            out.append(grp[0])
+            continue
+        best: Dict[str, Tuple[Run, str]] = {}
+        for r in grp:
+            for name, rows in r.all_agents.items():
+                if name not in best or len(rows) > len(best[name][0].all_agents[name]):
+                    best[name] = (r, name)
+        index_sets = {name: {x['index'] for x in r.all_agents[name]}
+                      for name, (r, _) in best.items()}
+        widest = max(index_sets.values(), key=len)
+        stray = [n for n, ix in index_sets.items() if not ix <= widest]
+        if stray:
+            msgs.append(f"NOT merged ({key[0]}, seed {key[2]}): {', '.join(stray)} "
+                        f"ran on different sessions from the other file(s); check "
+                        f"the sampling design, seed and sample size match.")
+            out.extend(grp)
+            continue
+        base = max(grp, key=lambda r: len(r.all_agents))
+        data = dict(base.meta)
+        data['merged_from'] = []
+        for k in AGENT_KEYS:
+            data[f'results_{k}'] = []
+        for name, (r, _) in best.items():
+            k = r.keys[name]
+            data[f'results_{k}'] = r.all_agents[name]
+            data.setdefault('llms', {})[k] = (r.meta.get('llms') or {}).get(k, name)
+            data['merged_from'].append({'agent': name, 'file': os.path.basename(r.path),
+                                        'sessions': len(r.all_agents[name])})
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"merged_{base.tag}.json")
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        merged = Run(path, data)
+        out.append(merged)
+        msgs.append(f"Merged {len(grp)} files for Scenario {key[0]}, seed {key[2]}: "
+                    + ", ".join(f"{m['agent']} {m['sessions']} from {m['file']}"
+                                for m in data['merged_from']))
+    return out, msgs
+
+
 def generate_paper_outputs(paths: Sequence[str], out_dir: Optional[str] = None,
                            n_boot: int = 2000, source: str = 'stated',
-                           tau: float = DEFAULT_TAU, verbose: bool = True) -> str:
+                           tau: float = DEFAULT_TAU, verbose: bool = True,
+                           merge: bool = False) -> str:
     """Analyse each run, then every cross-run table the set of runs supports."""
     runs, sweeps = load_runs(expand_paths(paths))
     if not runs and not sweeps:
@@ -1306,11 +1554,16 @@ def generate_paper_outputs(paths: Sequence[str], out_dir: Optional[str] = None,
         base = os.path.dirname(os.path.abspath(runs[0].path if runs else sweeps[0][0]))
         out_dir = os.path.join(base, 'paper', datetime.now().strftime('%Y%m%d_%H%M%S'))
     os.makedirs(out_dir, exist_ok=True)
+    if merge:
+        runs, msgs = merge_runs(runs, out_dir)
+        for m in msgs:
+            print(f"  [merge] {m}")
     index = [f"# Paper outputs — EV-IDS-Agent V32",
              f"", f"Generated {datetime.now():%Y-%m-%d %H:%M} from {len(runs)} run(s)"
              f" and {len(sweeps)} temperature sweep(s).", "",
              "LaTeX tables use `\\usepackage{booktabs}`.", ""]
 
+    produced: List[str] = []
     # Per-run analysis. Sweep runs (option b, lambda) feed only their own
     # cross-run tables and are not analysed individually to avoid clutter.
     for run in runs:
@@ -1321,6 +1574,7 @@ def generate_paper_outputs(paths: Sequence[str], out_dir: Optional[str] = None,
             print(f"\n{'=' * 100}\nPAPER METRICS — {run.tag} ({os.path.basename(run.path)})"
                   f"\n{'=' * 100}")
         w = analyse_run(run, sub, n_boot, source, tau, verbose)
+        produced += [os.path.basename(p) for p in w['tables'] + w['figures']]
         index.append(f"## {run.tag}  (`{os.path.basename(run.path)}`)")
         index += [f"- {os.path.relpath(p, out_dir)}" for p in w['tables'] + w['figures'] + w['other']]
         index.append("")
@@ -1338,6 +1592,7 @@ def generate_paper_outputs(paths: Sequence[str], out_dir: Optional[str] = None,
         index.append("## Cross-run")
     for t in cross:
         paths_w = t.write(os.path.join(cdir, 'tables'))
+        produced += [os.path.basename(p) for p in paths_w]
         index += [f"- {os.path.relpath(p, out_dir)}" for p in paths_w]
         if verbose:
             print(t.text())
@@ -1348,6 +1603,13 @@ def generate_paper_outputs(paths: Sequence[str], out_dir: Optional[str] = None,
         except Exception as e:
             print(f"  [figure skipped] temperature: {e}")
 
+    checklist = paper_checklist(runs, produced)
+    index += ["", "## Paper artifacts", ""]
+    index += [f"- {'✓' if ok else '✗'} **{name}** — {detail}" for name, ok, detail in checklist]
+    if verbose:
+        print(f"\n  PAPER ARTIFACTS (IDS-Agent numbering)")
+        for name, ok, detail in checklist:
+            print(f"    [{'OK' if ok else '--'}] {name:<26} {detail}")
     index += ["", "## Caveats", "",
               "- Figure 8 splits by difficulty zone and by correct/incorrect. It is "
               "not an out-of-distribution evaluation: no held-out attack family "
@@ -1357,8 +1619,12 @@ def generate_paper_outputs(paths: Sequence[str], out_dir: Optional[str] = None,
               "- 'Best ML' in the statistics table is selected on the test sessions, "
               "which favours the baseline.",
               "- Check `table_provenance_and_retrieval` before interpreting any "
-              "memory or RAG result: retrieval that returned nothing means the "
-              "component was not live."]
+              "memory or RAG result. Memory that retrieved nothing was not live; "
+              "RAG that retrieved no document fell back to fixed built-in "
+              "domain knowledge, which is not retrieval.",
+              "- An agent that completed fewer than "
+              f"{COMPLETE_FRACTION:.0%} of the sessions is reported in "
+              "`table_incomplete_agents` and excluded from the comparative tables."]
     with open(os.path.join(out_dir, 'README.md'), 'w', encoding='utf-8') as f:
         f.write("\n".join(index) + "\n")
     if verbose:
@@ -1378,10 +1644,13 @@ def main(argv=None):
                          "confidence or from the composite confidence")
     ap.add_argument('--tau', type=float, default=DEFAULT_TAU,
                     help='composite-confidence threshold for option (a)')
+    ap.add_argument('--merge', action='store_true',
+                    help='combine standard runs of the same scenario and seed that '
+                         'were run in parts (e.g. one model re-run on its own)')
     ap.add_argument('--quiet', action='store_true')
     a = ap.parse_args(argv)
     out = generate_paper_outputs(a.files, a.out, a.bootstrap, a.sensitivity_source,
-                                 a.tau, verbose=not a.quiet)
+                                 a.tau, verbose=not a.quiet, merge=a.merge)
     return 0 if out else 1
 
 

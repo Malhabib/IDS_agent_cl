@@ -306,6 +306,60 @@ def _paper_metrics_checks():
             readme = f.read()
         check("the README states that Figure 8 is not out-of-distribution",
               'not an out-of-distribution evaluation' in readme, True)
+        for name in ('table10_execution_time.csv', 'figure7_confusion_matrices.png',
+                     'figure7_confusion_matrices.pdf'):
+            check(f"paper output {name} is written", name in produced, True)
+        check("the README carries the paper-artifact checklist",
+              '## Paper artifacts' in readme and 'Table 10' in readme
+              and 'Figure 7' in readme, True)
+
+        # ── An agent that stopped early must not shrink the others' tables.
+        #    Reported case: Llama 100, Qwen 100, GLM 5 -> every paper table was
+        #    computed on n=5, discarding 95 of the complete models' sessions.
+        many = ['Malicious' if i % 2 else 'Normal' for i in range(100)]
+        d = {'use_knowledge': True, 'use_memory': True, 'use_xai': True,
+             'sample_seed': 42,
+             'llms': {'llama': 'llama3:latest', 'qwen': 'qwen3.5:latest',
+                      'glm': 'glm-4.7-flash:latest'},
+             'results_llama': [row(i, t, t) for i, t in enumerate(many)],
+             'results_qwen': [row(i, t, t) for i, t in enumerate(many)],
+             'results_glm': [row(i, t, t) for i, t in enumerate(many[:5])]}
+        run = P.Run('x.json', d)
+        check("an agent with 5 of 100 sessions is set aside as incomplete",
+              list(run.incomplete), ['GLM-4.7-flash'])
+        check("the comparative tables keep the complete agents' 100 sessions",
+              len(run.common_indices()), 100)
+        check("the incomplete agent is reported, not dropped silently",
+              P.table_incomplete(run) is not None, True)
+
+        # ── Merging a later single-model run into an earlier one.
+        later = dict(d, results_llama=[], results_qwen=[],
+                     results_glm=[row(i, t, t) for i, t in enumerate(many)])
+        wrong = dict(later, results_glm=[row(i + 5000, t, t) for i, t in enumerate(many)])
+        pa, pb, pc = (os.path.join(td, n) for n in ('early.json', 'glm.json', 'wrong.json'))
+        for path, obj in ((pa, d), (pb, later), (pc, wrong)):
+            with open(path, 'w') as f:
+                json.dump(obj, f)
+        merged, msgs = P.merge_runs(P.load_runs([pa, pb])[0], os.path.join(td, 'm'))
+        check("merging fills the stopped agent from the later run",
+              ([len(r) for r in merged[0].agents.values()], list(merged[0].incomplete)),
+              ([100, 100, 100], []))
+        refused, msgs = P.merge_runs(P.load_runs([pa, pc])[0], os.path.join(td, 'm2'))
+        check("merging runs on different sessions is refused",
+              len(refused) == 2 and any('NOT merged' in m for m in msgs), True)
+
+    # ── The runner offers three modes; Table 8 (b) and Table 9 live inside them.
+    main_src = inspect.getsource(R.main)
+    check("the run menu offers exactly modes 1-3", "Mode (1/2/3)" in main_src
+          and 'run_mode in ("4"' not in main_src and '"5"' not in main_src, True)
+    check("every mode runs the paper experiments",
+          'run_paper_experiments(' in main_src, True)
+    pe_src = inspect.getsource(R.run_paper_experiments)
+    check("the default-lambda row is reused from the main run, not run twice",
+          '_reference_lambda_file' in pe_src
+          and '[] if main_rows else [AGENT_LTM_LAMBDA]' in pe_src, True)
+    check("the console comparison sets incomplete models aside",
+          'COMPLETE_FRACTION' in inspect.getsource(R.print_triple_comparison), True)
 
 
 def main():
