@@ -29,10 +29,9 @@ RUN THE GATES FIRST — IN THIS ORDER
 PAPER TABLES AND FIGURES
   Every run ends by writing paper-ready tables (CSV + LaTeX) and figures
   (PNG + PDF) to  <workspace>/results/paper/<timestamp>/ , indexed in its
-  README.md. They are computed from the saved results JSON, so they can be
-  regenerated or combined across runs at any time without a model:
-      python paper_metrics_v33.py results/triple_llm_v6_v33_*.json
-  Run modes 4 and 5 produce the paper's Table 8 option (b) and Table 9.
+  README.md. ONE run produces everything: all three LLMs, then the Table 8 (b)
+  and Table 9 experiments, then every table and figure. Nothing has to be run
+  separately or merged afterwards.
 
 WHAT THIS RUNNER PRODUCES
   - Full V23 per-session trace: every step, the Stage 1 prompt containing each
@@ -83,7 +82,14 @@ PRINT_LOCK = threading.Lock()
 # run_classification._breaker(). These are deliberately generous: they do not
 # stop a slow run, they stop a broken one.
 BREAKER_MIN_SESSIONS   = 5      # never judge on fewer than this
-BREAKER_MAX_ERROR_RATE = 0.20   # >20% of sessions with no LLM answer -> ABORT
+# V33: a model is stopped ONLY when its backend is dead: this many sessions IN
+# A ROW with no answer, each after the client's own retry. V30-V32 stopped on
+# a 20% error RATE after 5 sessions, and that is what cut glm-4.7-flash off at
+# 5 of 100: 2 slow calls missed a fixed 300 s deadline. The client now adapts
+# its deadline and retries, so a sporadic error no longer ends the model; it
+# is recorded, reported and excluded from the model-decision counts.
+BREAKER_CONSECUTIVE    = 5
+BREAKER_WARN_RATE      = 0.20   # above this the run WARNS (once), never stops
 # Projected wall-clock after which the run says how long it will take. This is
 # a NOTICE, not a limit: it never stops a run. Sample size is the researcher's
 # decision and a slow result is still a result.
@@ -461,13 +467,17 @@ def run_classification(agent, emoji, label, selected, df, workers=1, confirm=Tru
     done    = 0
     total   = len(selected)
     n_error = 0
+    streak  = 0          # consecutive sessions with no LLM answer
     aborted = None
 
     def _progress(row):
-        nonlocal done, n_error
+        nonlocal done, n_error, streak
         done += 1
         if row['result'].get('llm_error'):
             n_error += 1
+            streak += 1
+        else:
+            streak = 0
         elapsed = time.time() - t_start
         eta     = (elapsed / done) * (total - done)
         sym = ("OK" if row['correct'] else "WRONG")
@@ -479,6 +489,7 @@ def run_classification(agent, emoji, label, selected, df, workers=1, confirm=Tru
                   f"[{sym}]{fb}{er}  elapsed={elapsed/60:.1f}m ETA={eta/60:.1f}m")
 
     warned_slow = [False]
+    warned_err  = [False]
 
     def _breaker():
         """
@@ -511,13 +522,22 @@ def run_classification(agent, emoji, label, selected, df, workers=1, confirm=Tru
                       f"longer than you want;\n    partial results are still "
                       f"written. Set EV_IDS_MAX_HOURS to move this notice.")
 
-        # The only abort condition: the model is not answering. Those sessions
-        # are labelled by the ML majority and scored as if the model had spoken,
-        # so continuing produces numbers that describe the GPU, not the model.
-        if n_error / done > BREAKER_MAX_ERROR_RATE:
-            return (f"{n_error} of the first {done} sessions were LLM errors "
-                    f"({n_error/done*100:.0f}%). The transport is failing; the "
-                    f"remaining {total-done} sessions would fail the same way.")
+        if n_error / done > BREAKER_WARN_RATE and not warned_err[0]:
+            warned_err[0] = True
+            with PRINT_LOCK:
+                print(f"\n  [LLM ERRORS — NOT STOPPING] {label}: {n_error} of {done} "
+                      f"sessions had no answer even after a retry. The run "
+                      f"continues;\n    those sessions are reported as LLM errors "
+                      f"and never scored as model decisions.")
+
+        # The only abort condition: the backend is DEAD -- several sessions in
+        # a row with no answer, each already retried by the client. Continuing
+        # would only label the rest by the ML majority.
+        if streak >= BREAKER_CONSECUTIVE:
+            return (f"the last {streak} sessions in a row got no answer from "
+                    f"the model, even after a retry each. The backend has "
+                    f"stopped responding; the remaining {total-done} sessions "
+                    f"would fail the same way.")
         return None
 
     if workers <= 1:
@@ -582,6 +602,8 @@ def run_classification(agent, emoji, label, selected, df, workers=1, confirm=Tru
                   if hasattr(agent.llm_client, 'health') else {})
         if health:
             print(f"  transport: {health['calls']} calls, "
+                  f"{health.get('retries', 0)} retried "
+                  f"({health.get('recovered', 0)} answered on the retry), "
                   f"{health['timeouts']} timeouts, {health['errors']} errors, "
                   f"{health['budget_clamps']} budget clamps, "
                   f"granted ctx {health['granted_ctx']}")
@@ -758,8 +780,8 @@ def print_triple_comparison(results_llama, results_qwen, results_glm, output_dir
         print(f"  zone table uses the {len(common)} sessions the complete models share.")
         if stopped:
             print(f"  {', '.join(stopped)} did not complete the run and must not be")
-            print(f"  reported alongside the others. Complete it by re-running that")
-            print(f"  model alone and merging (see 'Models to run' in the menu).")
+            print(f"  reported alongside the others. It stopped because its backend")
+            print(f"  stopped answering; run 'python healthcheck_v33.py' for the cause.")
 
     ground_truths = _ground_truths(results_llama)
     llama_preds   = {n: [r['model_predictions'].get(n, {}).get('prediction', 'Normal')
@@ -1603,27 +1625,11 @@ RUN MODE
     if run_mode not in ("1", "2", "3"):
         run_mode = "1"
 
-    # ── WHICH MODELS ────────────────────────────────────────────────────────
-    # Normally all three. Running a subset is how an agent the circuit breaker
-    # stopped early is completed later WITHOUT repeating the models that
-    # already finished; the earlier results file is merged at the end.
+    # ── MODELS ──────────────────────────────────────────────────────────────
+    # V33: one run, all three models, every paper table at the end. There is
+    # no subset or merge step: the client retries slow calls and the breaker
+    # only stops a dead backend, so every model is expected to finish here.
     run_slots = ['llama', 'glm', 'qwen']
-    merge_with = None
-    raw = input("\n  Models to run (llama,glm,qwen) [all]: ").strip().lower()
-    if raw:
-        run_slots = [x.strip() for x in raw.split(',')
-                     if x.strip() in ('llama', 'glm', 'qwen')] or run_slots
-    if len(run_slots) < 3:
-        print(f"  Running only: {', '.join(run_slots)}.")
-        print("  To complete an earlier run, give its results file: the paper tables")
-        print("  will combine both. The SAME scenario, XAI setting, sampling design,")
-        print("  seed and sample size must be chosen, or the merge is refused.")
-        raw = input("  Earlier results JSON to merge with (Enter to skip): ").strip().strip('"')
-        if raw:
-            if os.path.exists(raw):
-                merge_with = raw
-            else:
-                print(f"  Not found: {raw} -- continuing without a merge.")
 
     # ── PAPER EXPERIMENTS: Table 8 (prompted) and Table 9 ──────────────────
     paper_exp = input("\n  Run the paper experiments for Table 8 (prompted sensitivity)"
@@ -1788,12 +1794,8 @@ RUN MODE
         'self_consistency_k': sc_k,
     }
 
-    # RUN THE SELECTED MODELS. A model not selected keeps an empty result; the
-    # comparison and the paper tables handle that, and an earlier results file
-    # can supply it through the merge.
+    # RUN ALL THREE MODELS, one after another, in this single run.
     def run_slot(slot, label, previous):
-        if slot not in run_slots:
-            return []
         if backend == 'ollama' and previous:
             unload_ollama_model(previous, base_url)   # free VRAM for this model
         print(f"\nMANUAL: make sure {model_ids[slot]} is available on the backend")
@@ -1808,10 +1810,8 @@ RUN MODE
 
     results_llama = run_slot('llama', "LLAMA3", None)
     results_glm   = run_slot('glm', model_ids['glm'].split(':')[0].upper(),
-                             model_ids['llama'] if 'llama' in run_slots else None)
-    results_qwen  = run_slot('qwen', "QWEN3.5",
-                             model_ids['glm'] if 'glm' in run_slots
-                             else model_ids['llama'] if 'llama' in run_slots else None)
+                             model_ids['llama'])
+    results_qwen  = run_slot('qwen', "QWEN3.5", model_ids['glm'])
 
     # SAVE FIRST. The results used to be written only after the comparison
     # printed, and not at all if any model came back empty -- so a crash in
@@ -1849,8 +1849,6 @@ RUN MODE
               f"completed models are saved and analysed below.")
 
     paper_inputs = [results_file] if saved else []
-    if merge_with:
-        paper_inputs.append(merge_with)
     if run_mode in ("2", "3"):
         _, sweep_file = run_temperature_sweep(config, backend, base_url, scenario_tag,
                                               use_knowledge, use_memory, shared_store,
@@ -1870,7 +1868,7 @@ RUN MODE
             train_indices, base_meta)
 
     if paper_inputs:
-        _write_paper_outputs(paper_inputs, results_dir, merge=bool(merge_with))
+        _write_paper_outputs(paper_inputs, results_dir)
     print(f"\nTRIPLE LLM V33 SCENARIO {choice} COMPLETE!\n")
 
 

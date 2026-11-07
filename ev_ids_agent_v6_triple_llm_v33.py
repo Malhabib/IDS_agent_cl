@@ -271,6 +271,26 @@ if LLM_CALL_TIMEOUT_SEC <= 0:
     LLM_CALL_TIMEOUT_SEC = None   # no deadline, exactly like V23 through V29.2
 LLM_ERROR_PREFIX     = "Error:"
 
+# ── V33: ADAPTIVE DEADLINE AND ONE RETRY ─────────────────────────────────────
+# A fixed 300 s deadline is right for a model that answers in 30 s and wrong
+# for one that answers in 700 s. On the 6 GB machine glm-4.7-flash runs mostly
+# on the CPU (Stage 1 averaged 724 s), so 2 of its first 5 sessions missed the
+# fixed deadline, were recorded as LLM errors, and the circuit breaker stopped
+# GLM at 5 of 100 sessions. The model was not failing; it was slow.
+#
+# The deadline now follows the model's own measured speed:
+#   deadline = max(EV_IDS_TIMEOUT, DEADLINE_FACTOR x slowest successful call)
+# and a call that still misses it, or hits a transport fault (connection reset,
+# an Ollama runner restart), is retried ONCE with the same request and a
+# RETRY_FACTOR times longer deadline. The request is identical, so the retry
+# yields the answer the first attempt would have given. Only a call that
+# fails twice becomes an LLM error. Transport only: the prompts, budgets and
+# parsing are untouched.
+DEADLINE_FACTOR    = 3.0
+RETRY_FACTOR       = 4.0
+RETRY_MIN_DEADLINE = 1200      # seconds; the retry never gets less than this
+RETRY_PAUSE_SEC    = 5         # lets a restarted Ollama runner come back
+
 # A thinking model bills its reasoning channel against the SAME num_predict as
 # its answer. Below this many tokens it reliably emits reasoning and no answer.
 # Measured for GLM: Stage 2 was running on the 128-token floor with thinking on,
@@ -409,11 +429,15 @@ def config_banner(models=('llama3:latest', 'glm-4.7-flash:latest',
     """
     import hashlib
     payload = repr(sorted(MODEL_GEN_POLICY.items())) + repr(DEFAULT_GEN_POLICY)
+    # V33: the transport (adaptive deadline, one retry) is part of the
+    # fingerprint, so a copy without it is visibly different.
+    payload += repr(('retry', DEADLINE_FACTOR, RETRY_FACTOR, RETRY_MIN_DEADLINE))
     fp = hashlib.sha256(payload.encode()).hexdigest()[:8]
     lines = [f"  EFFECTIVE CONFIG   fingerprint {fp}",
              f"  {'-'*62}",
              f"  num_ctx {NUM_CTX}   timeout "
              f"{'none' if LLM_CALL_TIMEOUT_SEC is None else str(LLM_CALL_TIMEOUT_SEC)+'s'}"
+             f" (adapts to x{DEADLINE_FACTOR:g} the slowest answer, then one retry)"
              f"   temperature {LLM_TEMPERATURE}"]
     for m in models:
         p = gen_policy_for(m)
@@ -584,22 +608,30 @@ class OllamaClient:
         # V30 counters, read by the runner so a run can be judged on whether
         # the calls actually succeeded rather than on the scores alone.
         self.n_calls = self.n_timeouts = self.n_errors = self.n_clamped = 0
+        # V33: retries, and the slowest call that succeeded (drives the
+        # adaptive deadline). n_timeouts / n_errors count FINAL failures only.
+        self.n_retries = self.n_recovered = 0
+        self.slowest_ok = 0.0
+        self._lock = threading.Lock()
+        self._clients = {}
         # The context window Ollama ACTUALLY granted. Filled in by
         # refresh_actual_ctx(); until then the requested value is assumed.
         self.actual_ctx = NUM_CTX
         try:
             from ollama import Client
+            self._Client = Client
             # A module-level ollama.chat() has no timeout at all. A Client
             # carries one into httpx, so a stalled generation raises instead
             # of blocking the study indefinitely.
             self._client = Client(host=self.base_url, timeout=self.timeout)
+            self._clients[self.timeout] = self._client
             self.chat = self._client.chat
             print(f"  [OK] Ollama client ready for {model_name} "
                   f"(thinking={'ON' if self.thinking_capable else 'OFF'}, "
                   f"num_predict={self.policy['num_predict']}, "
                   f"repeat_penalty={self.policy['repeat_penalty']}, "
                   f"temperature={'default' if temperature is None else temperature}, "
-                  f"timeout={'none' if self.timeout is None else f'{self.timeout}s'})")
+                  f"timeout={'none' if self.timeout is None else f'{self.timeout}s adaptive, 1 retry'})")
         except ImportError:
             raise ImportError("Ollama library not installed. Run: pip install ollama")
 
@@ -649,7 +681,27 @@ class OllamaClient:
             room = 128
         return max(64, min(requested, room))
 
-    def _call(self, messages, temperature, max_tokens, force_no_think=False):
+    def _chat_for(self, deadline):
+        """The chat function carrying this per-call deadline (cached client)."""
+        if deadline == self.timeout:
+            return self.chat
+        with self._lock:
+            client = self._clients.get(deadline)
+            if client is None:
+                client = self._Client(host=self.base_url, timeout=deadline)
+                self._clients[deadline] = client
+        return client.chat
+
+    def current_deadline(self):
+        """First-attempt deadline: the configured one, stretched to the model's
+        own measured speed (DEADLINE_FACTOR x its slowest successful call)."""
+        if self.timeout is None:
+            return None
+        return int(max(self.timeout, DEADLINE_FACTOR * self.slowest_ok))
+
+    def _call(self, messages, temperature, max_tokens, force_no_think=False,
+              deadline=None):
+        chat = self._chat_for(self.timeout if deadline is None else deadline)
         # Per-model generation policy: a runaway-loop guard that is invisible to
         # models generating normal-length answers.
         ctx = self.actual_ctx or NUM_CTX
@@ -688,7 +740,7 @@ class OllamaClient:
         self.n_calls += 1
         if want_think:
             try:
-                return self.chat(think=True, **kwargs)
+                return chat(think=True, **kwargs)
             except Exception as e:
                 # Only a genuine "this model/client cannot do thinking" is
                 # allowed to disable the channel. V29.2 caught every exception
@@ -704,29 +756,72 @@ class OllamaClient:
                 print(f"    [THINK] {self.model_name} does not support the "
                       f"reasoning channel — disabling it for this run")
                 self.thinking_capable = False
-        return self.chat(**kwargs)
+        return chat(**kwargs)
+
+    @staticmethod
+    def _is_timeout(e):
+        msg = str(e).lower()
+        return 'timeout' in msg or 'timed out' in msg or isinstance(e, TimeoutError)
 
     def _guarded(self, fn, *a, **kw):
-        """Run one call, classifying failures instead of hiding them."""
-        try:
-            return fn(*a, **kw)
-        except Exception as e:
-            msg = str(e)
-            is_timeout = ('timeout' in msg.lower() or 'timed out' in msg.lower()
-                          or isinstance(e, TimeoutError))
+        """
+        Run one call, classifying failures instead of hiding them.
+
+        V33: the first attempt gets the adaptive deadline; a timeout or a
+        transport fault is retried ONCE with the identical request and a longer
+        deadline (see DEADLINE_FACTOR / RETRY_FACTOR). Only a second failure is
+        an LLM error. A slow model therefore completes its sessions instead of
+        being recorded as failing for being slow.
+        """
+        first = self.current_deadline()
+        retry = None if first is None else int(max(RETRY_MIN_DEADLINE,
+                                                   RETRY_FACTOR * first))
+        last = None
+        for attempt, deadline in enumerate((first, retry)):
+            t0 = time.time()
+            try:
+                out = fn(*a, deadline=deadline, **kw)
+            except Exception as e:
+                last = e
+                if attempt == 0:
+                    with self._lock:
+                        self.n_retries += 1
+                    what = (f"exceeded {deadline}s" if self._is_timeout(e)
+                            else f"transport fault: {str(e)[:120]}")
+                    print(f"    [RETRY] {self.model_name} {what} — retrying the same "
+                          f"request once with "
+                          + (f"a {retry}s deadline" if retry else "no deadline"))
+                    time.sleep(RETRY_PAUSE_SEC)
+                continue
+            took = time.time() - t0
+            with self._lock:
+                self.slowest_ok = max(self.slowest_ok, took)
+                if attempt:
+                    self.n_recovered += 1
+            if attempt:
+                print(f"    [RETRY OK] {self.model_name} answered on the retry "
+                      f"({took:.0f}s) — a model decision, not an LLM error")
+            return out
+        msg = str(last)
+        is_timeout = self._is_timeout(last)
+        with self._lock:
             if is_timeout:
                 self.n_timeouts += 1
-                print(f"    [TIMEOUT] {self.model_name} exceeded {self.timeout}s — "
-                      f"this session is an LLM ERROR, not a model decision")
             else:
                 self.n_errors += 1
-                print(f"    [LLM ERROR] {self.model_name}: {msg[:160]}")
-            return f"{LLM_ERROR_PREFIX} {'timeout' if is_timeout else msg}"
+        if is_timeout:
+            print(f"    [TIMEOUT] {self.model_name} missed the retry deadline too "
+                  f"({retry}s) — this session is an LLM ERROR, not a model decision")
+        else:
+            print(f"    [LLM ERROR] {self.model_name} failed twice: {msg[:160]}")
+        return f"{LLM_ERROR_PREFIX} {'timeout' if is_timeout else msg}"
 
     def health(self) -> dict:
         return {'calls': self.n_calls, 'timeouts': self.n_timeouts,
                 'errors': self.n_errors, 'budget_clamps': self.n_clamped,
-                'granted_ctx': self.actual_ctx}
+                'granted_ctx': self.actual_ctx,
+                'retries': self.n_retries, 'recovered': self.n_recovered,
+                'deadline': self.current_deadline()}
 
     def _extract(self, response, tag="THINK"):
         content  = _clean_content(response.message.content or "")

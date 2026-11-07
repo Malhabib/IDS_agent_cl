@@ -26,7 +26,7 @@ models are healthy -- that is what healthcheck_v33.py measures. Run this first
 (seconds), the healthcheck second (minutes), the study last (hours).
 """
 
-import sys
+import sys, io, inspect, threading, contextlib
 import numpy as np
 
 import ev_ids_agent_v6_triple_llm_v33 as A
@@ -362,6 +362,112 @@ def _paper_metrics_checks():
           'COMPLETE_FRACTION' in inspect.getsource(R.print_triple_comparison), True)
 
 
+def _retry_checks():
+    """V33 transport: adaptive deadline and one retry, without Ollama."""
+    import ev_ids_agent_v6_triple_llm_v33 as A
+    A.RETRY_PAUSE_SEC = 0
+
+    def client(script):
+        c = object.__new__(A.OllamaClient)
+        c.model_name, c.timeout = 'glm-4.7-flash:latest', 300
+        c.n_calls = c.n_timeouts = c.n_errors = c.n_clamped = 0
+        c.n_retries = c.n_recovered = 0
+        c.slowest_ok, c.actual_ctx = 0.0, 8192
+        c._lock = threading.Lock()
+        seen = []
+
+        def fn(*a, deadline=None, **kw):
+            seen.append(deadline)
+            step = script.pop(0)
+            if isinstance(step, Exception):
+                raise step
+            return step
+        return c, fn, seen
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        # A slow call that misses the first deadline is retried and ANSWERS:
+        # that is a model decision, not an LLM error.
+        c, fn, seen = client([Exception("timed out"), "Prediction: Attack"])
+        out = c._guarded(fn)
+    check("retry: a timed-out call is retried and its answer kept",
+          out, "Prediction: Attack")
+    check("retry: the recovered call is NOT an LLM error",
+          (c.n_timeouts, c.n_errors, c.n_retries, c.n_recovered), (0, 0, 1, 1))
+    check("retry: first attempt 300 s, retry RETRY_MIN_DEADLINE",
+          seen, [300, A.RETRY_MIN_DEADLINE])
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        c, fn, seen = client([Exception("timed out"), Exception("timed out")])
+        out = c._guarded(fn)
+    check("retry: two timeouts make ONE LLM error",
+          (out.startswith(A.LLM_ERROR_PREFIX), c.n_timeouts, c.n_retries),
+          (True, 1, 1))
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        c, fn, seen = client([ConnectionError("connection reset"), "ok"])
+        out = c._guarded(fn)
+    check("retry: a transport fault is retried too", (out, c.n_errors), ("ok", 0))
+
+    # The deadline follows the model's measured speed: after a 724 s answer
+    # (GLM Stage 1 on the 6 GB machine) the next call gets 3 x 724 s.
+    c, fn, seen = client([])
+    c.slowest_ok = 724.0
+    check("adaptive deadline = max(EV_IDS_TIMEOUT, 3 x slowest answer)",
+          c.current_deadline(), 2172)
+    check("retry deadline = 4 x the adaptive one",
+          int(max(A.RETRY_MIN_DEADLINE, A.RETRY_FACTOR * c.current_deadline())),
+          8688)
+    c.slowest_ok = 20.0
+    check("a fast model keeps the configured deadline", c.current_deadline(), 300)
+    c.timeout = None
+    check("EV_IDS_TIMEOUT=0 still means no deadline", c.current_deadline(), None)
+
+    # Every Ollama request goes through _guarded with a deadline keyword.
+    src = inspect.getsource(A.OllamaClient._call)
+    check("_call uses the per-attempt deadline", 'self._chat_for(' in src
+          and 'self.chat(' not in src, True)
+    check("the transport is in the fingerprint",
+          'RETRY_FACTOR' in inspect.getsource(A.config_banner), True)
+
+
+def _breaker_behaviour_checks(R):
+    """Run run_classification on scripted sessions: GLM's real pattern (2 LLM
+    errors in its first 5) must run to the END; a dead backend must stop."""
+    import pandas as pd
+
+    def run(errors_at, n=20):
+        df = pd.DataFrame({'label': [1] * n})
+        orig = (R._classify_one, R.test_llm_connectivity)
+
+        def fake(agent, idx, truth):
+            err = idx in errors_at
+            return {'index': idx, 'ground_truth': truth, 'predicted': truth,
+                    'correct': not err, 'majority_vote': truth,
+                    'result': {'llm_error': err, 'used_fallback': False}}
+        R._classify_one, R.test_llm_connectivity = fake, (lambda c: True)
+        agent = type('Ag', (), {'llm_client': object(),
+                                'store_correct_decision_in_ltm':
+                                    lambda self, *a, **k: None})()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rows = R.run_classification(agent, '[T]', 'T', list(range(n)), df,
+                                            workers=1, confirm=False)
+        finally:
+            R._classify_one, R.test_llm_connectivity = orig
+        return rows, buf.getvalue()
+
+    rows, out = run({0, 2})
+    check("2 LLM errors in the first 5 sessions no longer stop the model",
+          len(rows), 20)
+    check("...and the error rate is reported, not acted on",
+          'NOT STOPPING' in out and 'CIRCUIT BREAKER' not in out, True)
+    rows, out = run(set(range(3, 20)))
+    check("a dead backend (5 in a row) still stops the model",
+          (len(rows), 'CIRCUIT BREAKER' in out), (8, True))
+    rows, out = run({1, 2, 3, 4, 6, 7, 8, 9, 11})
+    check("errors broken by answers never trip the breaker", len(rows), 20)
+
+
 def main():
     # 1 ── verdict formats
     for text, want in VERDICT_CASES:
@@ -631,22 +737,28 @@ def main():
         # guard that covers one code path is not a guard, and nothing but this
         # assertion would have noticed.
         src = inspect.getsource(R.run_classification)
-        serial, parallel = src.split('    else:', 1)
+        loop = src[src.index('    if workers <= 1:'):]
+        serial, parallel = loop.split('\n    else:\n', 1)
         check("circuit breaker guards the serial path",
               '_breaker()' in serial, True)
         check("circuit breaker guards the PARALLEL path",
               '_breaker()' in parallel, True)
-        # The breaker must ABORT only on unanswered calls. Aborting on duration
-        # discarded a clean 200-session Qwen run at session 5.
+        # The breaker must ABORT only on a dead backend. Aborting on duration
+        # discarded a clean 200-session Qwen run at session 5; aborting on a
+        # 20% error rate after 5 sessions cut GLM off at 5 of 100.
         breaker = src[src.index('def _breaker'):src.index('if workers <= 1')]
         abort_lines = [l for l in breaker.splitlines()
                        if l.strip().startswith('return (')]
-        check("the breaker's only abort condition is the error rate",
+        check("the breaker has exactly one abort condition",
               len(abort_lines), 1)
         check("duration warns instead of aborting",
               'NOT STOPPING' in breaker, True)
-        check("the error-rate abort is still present",
-              'n_error / done > BREAKER_MAX_ERROR_RATE' in breaker, True)
+        check("the only abort is a run of consecutive dead sessions",
+              'streak >= BREAKER_CONSECUTIVE' in breaker, True)
+        check("the error RATE no longer aborts",
+              'n_error / done > BREAKER_WARN_RATE' in breaker
+              and 'BREAKER_MAX_ERROR_RATE' not in src, True)
+        _breaker_behaviour_checks(R)
         check("the parallel path cancels queued work when it trips",
               'cancel' in parallel, True)
         check("llm errors are counted in progress", 'llm_error' in src, True)
@@ -730,6 +842,14 @@ def main():
               [r['index'] for r in R._restrict(full_a, [3, 1])], [3, 1])
     except Exception as e:
         FAIL.append(f"runner import failed: {e}")
+
+    # 9b ── V33 TRANSPORT: adaptive deadline and one retry.
+    try:
+        _retry_checks()
+    except Exception as e:
+        import traceback
+        FAIL.append(f"retry checks crashed: {type(e).__name__}: {e}\n"
+                    + traceback.format_exc())
 
     # 10 ── PAPER METRICS. Every number in the paper tables comes from here, so
     #       the core metrics are pinned to hand-computed values, and the

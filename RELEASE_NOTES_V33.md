@@ -10,11 +10,50 @@ happened.
 ## V33 at a glance
 
 **V33 = V32 + one round of fixes to how results are run and reported.** The
-detection pipeline is unchanged: mapping the V33 agent module's version text
-back to V32 reproduces the committed V32 file exactly, and V32 was itself the
-V31 pipeline.
+detection pipeline (prompts, the two-stage flow, budgets, verdict parsing) is
+unchanged since V31. The one change inside the agent file is the Ollama
+*transport*: how long a call may take and what happens when it does not
+return (§ "One run, all three models" below).
 
-What changed since V32 (details in §0b):
+**One run does everything.** Start the runner once: it runs Llama, GLM and Qwen
+on the same sessions, then the Table 8 (b) and Table 9 experiments, then writes
+every paper table and figure. There is no model-subset prompt, no merge step
+and no separate metrics command.
+
+Check you are running this copy: `python selftest_v33.py` prints
+**fingerprint dd5c096b** and **V33 OFFLINE SELF-TEST**.
+
+### One run, all three models
+
+The V32 run stopped glm-4.7-flash at 5 of 100 sessions. Its calls were not
+failing, they were slow: on that machine GLM runs mostly on the CPU (Stage 1
+averaged 724 s), so 2 of its first 5 sessions missed the fixed 300 s deadline,
+were recorded as LLM errors, and the breaker's 20% error-rate rule stopped it.
+Three changes, all transport, none in the decision path:
+
+- **Adaptive deadline.** Each call's deadline is
+  `max(EV_IDS_TIMEOUT, 3 × the model's slowest successful call)`, so it follows
+  the model's measured speed on the machine. A model answering in 700 s gets
+  about 2,100 s; a fast model keeps 300 s.
+- **One retry.** A call that still misses its deadline, or hits a transport
+  fault (connection reset, Ollama runner restart), is retried once with the
+  identical request and a 4× longer deadline (at least 1,200 s). Only a call
+  that fails twice is an LLM error. The console shows `[RETRY]` /
+  `[RETRY OK]`, and each model's summary line counts retries and recoveries.
+- **The breaker only stops a dead backend:** 5 sessions *in a row* with no
+  answer, each already retried. A sporadic error is recorded, reported and
+  never scored as a model decision, and the run goes on; a high error rate
+  prints one notice instead of stopping the model.
+
+Verified offline: the real runner menu, driven end to end with GLM scripted to
+fail 2 of its first 5 sessions exactly as on the V32 run, completes 50/50
+sessions for all three models in one run and writes Tables 6–10 and
+Figures 7–8. Self-test (218 checks) covers the retry, the adaptive deadline and
+the breaker, and fails if any of them is reverted.
+
+### Also since V32
+
+Details of the paper-metrics work in §0b:
 
 - **Three run modes, and every one produces every paper artifact.** The
   separate modes for Table 8 (b) and Table 9 are gone; their runs happen inside
@@ -25,15 +64,13 @@ What changed since V32 (details in §0b):
   Tables 6–10 and Figures 7–8. A checklist of these ends every run.
 - **An agent that stops early no longer shrinks the tables.** Below 90% of the
   sessions it is reported on its own and kept out of the comparisons.
-- **Completing a run without repeating it:** re-run one model and merge it with
-  the earlier results file.
 - **RAG reporting corrected:** with no knowledge base, the fixed built-in
   knowledge text is reported as such, not as retrieval.
 
 Files (all in one folder):
 
 ```
-ev_ids_agent_v6_triple_llm_v33.py   detection pipeline (unchanged since V31)
+ev_ids_agent_v6_triple_llm_v33.py   detection pipeline (unchanged since V31) + retrying transport
 simple_run_v6_triple_llm_v33.py     interactive runner, run modes 1–3
 paper_metrics_v33.py                paper tables and figures from results JSON
 llm_eval_metrics_v33.py             statistics helpers
@@ -51,9 +88,8 @@ python healthcheck_v33.py --n 50
 python simple_run_v6_triple_llm_v33.py
 ```
 
-The results format is unchanged, so results from V31 and V32 runs load into
-`paper_metrics_v33.py` as they are, and can be merged with V33 runs. The XAI
-cache (`xai_cache.pkl`) carries over.
+The results format is unchanged and the XAI cache (`xai_cache.pkl`) carries
+over, so the SHAP/LIME work already done is not repeated.
 
 ---
 
@@ -116,12 +152,7 @@ addition reads the results JSON a run saves.
 
 ### `paper_metrics_v33.py`
 
-Run automatically at the end of every run, or by hand on any set of results:
-
-```
-python paper_metrics_v33.py results/triple_llm_v6_v33_*.json
-```
-
+Runs automatically at the end of every run; there is nothing to run by hand.
 It writes every table as CSV **and** LaTeX (booktabs) and every figure as PNG
 **and** PDF into `results/paper/<timestamp>/`, with a `README.md` index.
 
@@ -198,7 +229,7 @@ and PR-AUC agree with tied scores.
 - **A checklist of the paper's artifacts** ends every run: Tables 6/7, 8 (a),
   8 (b), 9 and 10, Figures 7 and 8, each marked present or given a reason.
 
-### Incomplete agents and completing a run
+### Incomplete agents
 
 An agent with fewer than 90% of the sessions the most complete agent has is
 **set aside**: reported in `table_incomplete_agents` (sessions reached, LLM
@@ -208,17 +239,9 @@ the sessions it reached — a run with Llama 100, Qwen 100 and GLM 5 produced
 paper tables over n = 5, discarding 95 of the complete models' 100 sessions.
 The console comparison follows the same rule.
 
-To complete that model later without repeating the others, choose
-`Models to run: glm` with the **same** scenario, XAI setting, sampling design,
-seed and sample size, and give the earlier results file when asked. The paper
-tables then merge the two files, taking each model from the file in which it
-completed most sessions. By hand:
-
-```
-python paper_metrics_v33.py earlier.json glm_only.json --merge
-```
-
-A merge is refused if the files cover different sessions.
+With the V33 transport this should only happen when a model's backend stops
+answering altogether (the breaker's one abort condition); the rule stays as a
+safeguard so such a model can never distort the other two.
 
 ### RAG in Scenarios A and B
 
